@@ -1,0 +1,8 @@
+# Build trees
+build/
+build-*/
+# Packaged binaries (regenerated from the build)
+dist/*.zip
+dist/**/*.exe
+dist/**/*.log
+__pycache__/
