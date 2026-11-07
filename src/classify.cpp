@@ -154,6 +154,16 @@ AllocationInfo classifyAllocation(const std::vector<uint16_t>& ports,
     return out;
 }
 
+std::optional<Duration> mappingLifetime(const NatProfile& p) {
+    const NatDetails& d = p.details;
+    if (!d.behindNat || p.predictability == Predictability::UdpBlocked ||
+        p.predictability == Predictability::Inconclusive)
+        return std::nullopt;
+    if (p.lifetimeMeasured) return d.bidirectionalLifetime ? d.bidirectionalLifetime : d.singlePacketLifetime;
+    if (d.mapping == MappingBehavior::EndpointIndependent) return Duration(120000);   // RFC 4787 REQ-5
+    return std::nullopt;
+}
+
 const char* toString(Predictability p) {
     switch (p) {
     case Predictability::Stable: return "Stable";

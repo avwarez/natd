@@ -270,6 +270,7 @@ only in ways that serve that NAT.
 | Keepalive | RFC 8085 §3.5: >= 15 s, with jitter | stream 20 s + up to 10% random; profile default 15 s |
 | Stream | RFC 8085 §3.1: congestion control | the application's transport (the KCP of the tests: normal mode, `nc = 0`) |
 | Mapping, filtering, hairpin | RFC 4787 §4.1, §5, REQ-9; RFC 5780 §4.3-4.4 | classified as defined there |
+| Mapping lifetime | RFC 4787 REQ-5 (>= 2 min), REQ-6 (outbound refresh) | `mappingLifetime()`: the measurement, else 2 min for an endpoint-independent mapping, else none |
 | CGNAT | RFC 6888 REQ-4: port quota | `maxMappings` caps |
 
 Exceptions, each one only after a measurement shows the NAT is outside RFC
@@ -277,7 +278,8 @@ Exceptions, each one only after a measurement shows the NAT is outside RFC
 
 - a binding lifetime shorter than REQ-5's 2 minutes: punch interval and
   keepalive follow the measurement (40% of the single-packet lifetime, 50%
-  of the bidirectional one), down to `minInterval`;
+  of the bidirectional one), down to `minInterval`, and `mappingLifetime()`
+  gives the measured value;
 - a dependent mapping (against REQ-1): `Predict` and the birthday strategies
   send to many ports of the peer's IP within one round; a NAT with
   endpoint-independent mapping never gets them (`Direct`);

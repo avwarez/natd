@@ -626,6 +626,7 @@ static void testDiscovery() {
         auto r = runDiscovery(m, false); show("no NAT", r);
         CHECK_EQ(r.final.predictability, Predictability::Stable);
         CHECK(!r.final.details.behindNat);
+        CHECK(!mappingLifetime(r.final));   // no mapping to keep
     }
     // Lifetime: Nokia-like 15 s first-packet timer, 65 s once bidirectional
     {
@@ -636,6 +637,7 @@ static void testDiscovery() {
         CHECK(r.final.details.bidirectionalLifetime == Duration(60000));
         CHECK_EQ(r.final.punchInterval, Duration(4000));     // 40% of 15 s = 6 s, capped at 4 s
         CHECK_EQ(r.final.keepaliveInterval, Duration(30000)); // 50% of 60 s
+        CHECK(mappingLifetime(r.final) == Duration(60000));   // measured, after inbound
         CHECK(r.provisional.keepaliveInterval == Duration(15000));   // RFC 8085 §3.5 until measured
         CHECK(r.provisionalAtSec < 15);
         CHECK(r.finalAtSec < 190);
@@ -647,6 +649,7 @@ static void testDiscovery() {
         CHECK(r.final.details.singlePacketLifetime == Duration(5000));
         CHECK_EQ(r.final.punchInterval, Duration(2000));
         CHECK_EQ(r.final.keepaliveInterval, Duration(5000));
+        CHECK(mappingLifetime(r.final) == Duration(10000));   // measured, below RFC 4787 REQ-5
     }
     {
         NatModel m; m.singleTimeout = Duration(3000); m.bidirTimeout = Duration(4000);
@@ -654,6 +657,29 @@ static void testDiscovery() {
         CHECK(r.final.lifetimeMeasured);            // replies acknowledged, none refused: real expiry
         CHECK_EQ(r.final.punchInterval, Duration(1000));
         CHECK_EQ(r.final.keepaliveInterval, Duration(1000));
+        CHECK(!mappingLifetime(r.final));   // below the smallest value: nothing to rely on
+    }
+    // Not measured: the RFC 4787 REQ-5 minimum, only for a mapping that
+    // conforms to REQ-1 (endpoint independent).
+    {
+        NatModel m; m.singleTimeout = Duration(17000); m.bidirTimeout = Duration(65000);
+        auto r = runDiscovery(m, false); show("EIM, lifetime not measured", r);
+        CHECK(!r.final.lifetimeMeasured);
+        CHECK(mappingLifetime(r.final) == Duration(120000));
+        NatProfile p = r.final;
+        p.details.mapping = MappingBehavior::AddressPortDependent;
+        CHECK(!mappingLifetime(p));
+        p.details.mapping = MappingBehavior::AddressDependent;
+        CHECK(!mappingLifetime(p));
+        p.details.mapping = MappingBehavior::Unknown;
+        CHECK(!mappingLifetime(p));
+        p = r.final;
+        p.predictability = Predictability::UdpBlocked;
+        CHECK(!mappingLifetime(p));
+        p = r.final;   // only the outbound-only variant known
+        p.lifetimeMeasured = true;
+        p.details.singlePacketLifetime = Duration(30000);
+        CHECK(mappingLifetime(p) == Duration(30000));
     }
     // Reflector quota exhausted (many subscribers behind the same CGNAT IP):
     // refused probes are unknown, not expired; timers stay at defaults.

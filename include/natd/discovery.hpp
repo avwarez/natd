@@ -243,6 +243,19 @@ const char* toString(FilteringBehavior);
 const char* toString(AllocationPattern);
 const char* toString(HairpinBehavior);
 
+// How long the mapping of the primary socket survives with no outgoing
+// datagram, as far as the profile tells; an application that must keep the
+// mapping (its public port published somewhere) sends something before it.
+//   - lifetime measured: the measured lower bound (after inbound traffic,
+//     the primary socket's case; outbound-only if only that is known), also
+//     when below RFC 4787 REQ-5;
+//   - not measured (STUN only) and endpoint-independent mapping: 2 minutes,
+//     the least RFC 4787 REQ-5 allows (REQ-6: outbound refresh is required);
+//   - nothing otherwise: no NAT, no result, a lifetime below the smallest
+//     measured value, or a mapping that already breaks RFC 4787 REQ-1, so
+//     REQ-5 cannot be assumed either.
+std::optional<Duration> mappingLifetime(const NatProfile&);
+
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------

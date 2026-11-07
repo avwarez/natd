@@ -12,6 +12,18 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-08
+
+### API
+- `natd::mappingLifetime(const NatProfile&)`: how long the primary socket's
+  mapping survives with no outgoing datagram, for an application that keeps
+  its public port published (a LowID's port in Kad) and must send something
+  before it. The measured lifetime when there is one (after inbound
+  traffic, else outbound-only), also below RFC 4787 REQ-5; not measured and
+  endpoint-independent mapping: 2 minutes (REQ-5 minimum, REQ-6 outbound
+  refresh); nothing without a NAT, without a result, below the smallest
+  measured value, or for a mapping that already breaks REQ-1.
+
 ## [0.1.2] - 2026-11-07
 
 ### Fixes
