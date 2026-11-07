@@ -2325,6 +2325,10 @@ static void testAgent() {
         CHECK(r.saw(0, AgentEventType::Closed, t0, &err) && err == SessionError::Reset);
         CHECK_EQ(r.a[0]->phase(t0), SessionPhase::Over);
         CHECK(!r.saw(0, AgentEventType::EndpointChanged));   // checked, and found the same
+        r.run(Duration(10000));   // the check starts when the stream is declared dead, near the end above
+        CHECK(r.saw(0, AgentEventType::EndpointChecked));
+        CHECK_EQ(r.a[0]->lastCheckResult(), QuickCheckResult::Valid);
+        CHECK(!r.a[0]->checking());
         CHECK_EQ(r.a[0]->stats().streamsDead, 1u);
         CHECK_EQ(r.a[0]->stats().endpointChecks, 1u);
         CHECK_EQ(r.a[0]->stats().punchesEstablished, 2u);
@@ -2343,9 +2347,13 @@ static void testAgent() {
         r.run(Duration(20000));
         CHECK(r.saw(0, AgentEventType::Connected, s0) && r.saw(1, AgentEventType::Incoming, s1));
         r.w[0].box.flush();
+        CHECK_EQ(r.a[0]->lastCheckResult(), QuickCheckResult::Pending);   // none yet
         r.a[0]->checkEndpoint(r.w.loop.now, true);
+        CHECK(r.a[0]->checking());
         r.a[0]->checkEndpoint(r.w.loop.now, true);   // one check at a time
         r.run(Duration(10000));
+        CHECK(r.saw(0, AgentEventType::EndpointChecked));
+        CHECK_EQ(r.a[0]->lastCheckResult(), QuickCheckResult::Changed);
         CHECK(r.saw(0, AgentEventType::EndpointChanged));
         CHECK(r.a[0]->publicEndpoint() != before);
         SessionError err = SessionError::None;

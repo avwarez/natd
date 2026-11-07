@@ -276,6 +276,7 @@ private:
 // Quick re-validation of a profile (network change, IP change, block rotation)
 // ---------------------------------------------------------------------------
 enum class QuickCheckResult : uint8_t { Pending, Valid, Changed, Unreachable };
+const char* toString(QuickCheckResult);
 
 class QuickCheck {
 public:

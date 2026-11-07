@@ -77,6 +77,8 @@ enum class AgentEventType : uint8_t {
     Writable,           // write() takes bytes again, after it returned 0
     Closed,             // the session is over, `error` says why; it comes after the
                         // bytes that arrived before the end were read. Then release().
+    EndpointChecked,    // an endpoint check ended: lastCheckResult() (Valid, Changed:
+                        // EndpointChanged follows, Unreachable)
 };
 
 enum class SessionError : uint8_t {
@@ -167,6 +169,10 @@ public:
     // none within checkReuse of the last. closeIfChanged: the open streams
     // end (AddressChanged) if it did change. A dead stream checks by itself.
     void checkEndpoint(TimePoint now, bool closeIfChanged);
+    // The result of the last check that ended (Pending: none yet), and
+    // whether one is running now.
+    QuickCheckResult lastCheckResult() const;
+    bool checking() const;
 
     // Sessions. connect() punches towards a peer that was sent an offer;
     // accept() answers an offer that came in. Both return 0 when refused at

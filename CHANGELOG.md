@@ -12,6 +12,14 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-07
+
+### API changes
+- `AgentEventType::EndpointChecked`: an endpoint check ended, with or
+  without a change; `Agent::lastCheckResult()` gives the result and
+  `Agent::checking()` whether one is running, so that an application can
+  log every check (`toString(QuickCheckResult)`).
+
 ## [0.1.0] - 2026-11-07
 
 The first public release.

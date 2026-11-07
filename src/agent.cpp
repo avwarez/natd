@@ -23,6 +23,7 @@ const char* toString(AgentEventType t) {
         case AgentEventType::Readable:        return "Readable";
         case AgentEventType::Writable:        return "Writable";
         case AgentEventType::Closed:          return "Closed";
+        case AgentEventType::EndpointChecked: return "EndpointChecked";
     }
     return "?";
 }
@@ -99,6 +100,7 @@ struct Agent::Impl {
     bool checkedOnce = false;
     TimePoint lastCheck{};
     bool closeIfChanged = false;
+    QuickCheckResult lastCheckResult = QuickCheckResult::Pending;
     std::map<SessionId, std::unique_ptr<Session>> sessions;
     // Open streams by (socket, remote endpoint): a datagram finds its stream
     // in one lookup. A stream accepts only that pair, so nothing is missed.
@@ -261,6 +263,8 @@ struct Agent::Impl {
             next = std::min(next, check->poll(now));
             const QuickCheckResult r = check->result();
             if (r != QuickCheckResult::Pending) {
+                lastCheckResult = r;
+                emit(AgentEventType::EndpointChecked);
                 if (r == QuickCheckResult::Changed) {
                     profile.publicEndpoint = check->observed();
                     ++stats.endpointChanges;
@@ -417,6 +421,9 @@ const NatProfile& Agent::profile() const { return impl_->profile; }
 Endpoint Agent::publicEndpoint() const { return impl_->ready ? impl_->profile.publicEndpoint : Endpoint{}; }
 bool Agent::directPunchable() const { return impl_->directPunchable(); }
 PeerInfo Agent::localPeerInfo() const { return impl_->localPeerInfo(); }
+
+QuickCheckResult Agent::lastCheckResult() const { return impl_->lastCheckResult; }
+bool Agent::checking() const { return impl_->check != nullptr; }
 
 void Agent::checkEndpoint(TimePoint now, bool closeIfChanged) {
     impl_->startCheck(closeIfChanged, now);

@@ -198,6 +198,16 @@ const char* toString(AllocationPattern a) {
     return "?";
 }
 
+const char* toString(QuickCheckResult r) {
+    switch (r) {
+    case QuickCheckResult::Pending: return "Pending";
+    case QuickCheckResult::Valid: return "Valid";
+    case QuickCheckResult::Changed: return "Changed";
+    case QuickCheckResult::Unreachable: return "Unreachable";
+    }
+    return "?";
+}
+
 const char* toString(HairpinBehavior h) {
     switch (h) {
     case HairpinBehavior::Unknown: return "Unknown";

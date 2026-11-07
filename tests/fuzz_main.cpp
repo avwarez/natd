@@ -614,7 +614,8 @@ void fuzzAgent(const uint8_t* d, size_t n) {
         auto drain = [&] {
             AgentEvent e;
             while (agent.nextEvent(e)) {
-                if (e.type == AgentEventType::ProfileReady || e.type == AgentEventType::EndpointChanged) {
+                if (e.type == AgentEventType::ProfileReady || e.type == AgentEventType::EndpointChanged ||
+                    e.type == AgentEventType::EndpointChecked) {
                     REQUIRE(e.session == 0);
                     continue;
                 }
