@@ -316,9 +316,11 @@ struct NatDiscovery::Impl {
     }
 
     // Undecided mapping: ask the next STUN servers (at most twice; nothing is
-    // sent when all asked servers answered and nothing is left).
-    bool moreMappingServers(const MapEval& ev) {
-        if (mapBatches >= 2) return false;
+    // sent when all asked servers answered and nothing is left). With no
+    // public address yet from STUN alone, every server may be asked in turn:
+    // a silent server says nothing about UDP.
+    bool moreMappingServers(const MapEval& ev, bool noAnswerYet = false) {
+        if (mapBatches >= 2 && !noAnswerYet) return false;
         if (addMappingBatch(!r0Pair() && !ev.pairTested, !r1Open() && !ev.ipTested) == 0) return false;
         ++mapBatches;
         return true;
@@ -344,7 +346,12 @@ struct NatDiscovery::Impl {
     // when the phase may end without them.
     bool mappingDoneWithoutStale() {
         auto ip = provisionalPublicIp();
-        if (!ip) return false;
+        if (!ip) {
+            // Nobody answered yet: with STUN alone, ask the next servers in
+            // parallel; with a reflector, its own probes decide.
+            if (!havePair()) moreMappingServers(MapEval{}, true);
+            return false;
+        }
         const MapEval ev = evalMapping(*ip, !havePair());
         if (ev.decided) return true;
         moreMappingServers(ev);   // in parallel with the stale ones
@@ -397,6 +404,9 @@ struct NatDiscovery::Impl {
                 nsDest = best->front()->dest;
             }
         }
+        // STUN alone and no two answers agreeing yet: ask the servers not
+        // asked so far before UDP is declared blocked.
+        if (!prof.publicEndpoint.valid() && !havePair() && moreMappingServers(MapEval{}, true)) return;
         if (!prof.publicEndpoint.valid()) {   // nobody answered
             prof.predictability = Predictability::UdpBlocked;
             prof.confidence = 1.0;

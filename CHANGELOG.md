@@ -12,6 +12,16 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-07
+
+### Fixes
+- Discovery from STUN servers alone declared UDP blocked when the first
+  servers it asked did not answer (on eMule's test bench its IP filter
+  dropped the answers of 13 of 16 built-in servers): it now asks the
+  servers not asked yet, in parallel once the silent ones are stale, and
+  declares UDP blocked only when none is left. 9 of 12 silent: Stable in
+  17.7 s (was UdpBlocked at 39.5 s); all silent: UdpBlocked at 57 s.
+
 ## [0.1.1] - 2026-11-07
 
 ### API changes

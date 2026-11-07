@@ -1199,6 +1199,26 @@ static void testResilience() {
             auto r = runDiscovery(m, true, 1, {}, none);
             CHECK_EQ(r.final.details.mapping, MappingBehavior::AddressDependent);
         }
+        // STUN only, and the first servers in the list never answer (an
+        // application's IP filter dropping them, as eMule's did with 13 of 16):
+        // the next ones are asked before UDP is declared blocked.
+        {
+            NatModel m; m.mapping = Map::EI; m.filtering = Filt::APD; m.alloc = Alloc::Preserve;
+            auto lastThree = [](Net& n) { for (size_t i = 0; i + 3 < n.stun.size(); ++i) n.stun[i].alive = false; };
+            auto r = runDiscovery(m, false, 1, {}, none, lastThree);
+            CHECK_EQ(r.final.predictability, Predictability::Stable);
+            CHECK_EQ(r.final.details.mapping, MappingBehavior::EndpointIndependent);
+            CHECK_EQ(r.final.publicEndpoint.ip, m.publicIp);
+            std::printf("  STUN only, 9 of 12 servers silent: %s, final at %.1f s\n", toString(r.final.predictability), r.finalAtSec);
+            auto allSilent = [](Net& n) { for (auto& sv : n.stun) sv.alive = false; };
+            auto b = runDiscovery(m, false, 1, {}, none, allSilent);
+            CHECK_EQ(b.final.predictability, Predictability::UdpBlocked);
+            uint64_t asked = 0;
+            for (size_t i = 0; i < 12; ++i) asked += 1;   // every server is asked before giving up
+            CHECK(b.stunRequests >= 2 * asked);
+            std::printf("  STUN only, all silent: %s at %.1f s, %llu requests\n", toString(b.final.predictability), b.finalAtSec,
+                        (unsigned long long)b.stunRequests);
+        }
     }
     // Network change mid-run (new public IP): started over once, result for
     // the new network.
