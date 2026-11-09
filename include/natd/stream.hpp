@@ -13,9 +13,10 @@
 //                flow and congestion control (RFC 8085 §3.1 is its job). It
 //                is an IStreamTransport the application implements, created
 //                per session by a StreamTransportFactory; natd knows no
-//                transport protocol. Both peers must run the same one: the
-//                application says which in its offer (Offer::kind) if it may
-//                ever have more than one.
+//                transport protocol. Both peers must run the same one: each
+//                PUNCH carries the transports its sender runs (TransportSet)
+//                and both peers take the same one of those in common, on
+//                every signalling channel, with no message of their own.
 //
 // Path maintenance, which only natd can do since it knows the NAT:
 //   - keepalive: when nothing was sent for `keepalive` (plus a jitter of up
@@ -55,7 +56,18 @@ public:
     virtual bool failed() const = 0;
 };
 
+// The stream transports an application runs, as a bitmask it defines (for
+// instance 0x01 its first transport, 0x02 a later one). A punch sends ours in
+// every PUNCH; the stream then runs the highest bit both peers have, which
+// both work out alike. A peer that declares none (0: natd before 0.1.4) runs
+// the first, bit 0.
+using TransportSet = uint8_t;
+constexpr TransportSet kFirstTransport = 0x01;
+// The transport two peers run: one bit, 0 when they have none in common.
+TransportSet chooseTransport(TransportSet ours, TransportSet theirs);
+
 struct StreamTransportInfo {
+    TransportSet transport = kFirstTransport;   // the one both peers agreed on (one bit)
     TxId     token{};              // the session token, the same on both peers
     size_t   maxPayload = 0;       // largest payload output() takes
     TimePoint now{};
@@ -70,6 +82,7 @@ struct StreamConfig {
     SocketId socket = 0;          // the punched socket (PunchSession::establishedSocket)
     Endpoint remote;              // PunchSession::remoteEndpoint
     TxId     token{};             // the punch's session token
+    TransportSet transport = kFirstTransport;   // PunchSession::transport(), for the factory
     // At least 15 s (RFC 8085 §3.5). Each keepalive comes after a random
     // extra of up to a tenth of the period (jitter, RFC 8085 §3.5, RFC 7675).
     Duration keepalive{20000};

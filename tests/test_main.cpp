@@ -2178,9 +2178,10 @@ struct AgentRig {
     SocketId prim[2];
     std::unique_ptr<Agent> a[2];
     std::vector<AgentEvent> ev[2];
+    std::vector<TransportSet> made[2];   // what each factory was asked for
     bool deaf[2] = {false, false};
 
-    AgentRig(NatModel m0, NatModel m1, uint32_t seed, std::function<void(AgentConfig&)> tweak = {}) : w(m0, m1, seed) {
+    AgentRig(NatModel m0, NatModel m1, uint32_t seed, std::function<void(AgentConfig&, int)> tweak = {}) : w(m0, m1, seed) {
         for (uint32_t i = 0; i < 6; ++i) stun.push_back(StunServer{{kStunBase + 20 + i, 3478}, 3479});
         for (int i = 0; i < 2; ++i) {
             prim[i] = *w[i].openSocket(4672);
@@ -2200,8 +2201,11 @@ struct AgentRig {
             c.discovery.primarySocket = prim[i];
             c.discovery.measureLifetime = false;
             for (auto& sv : stun) c.discovery.stunServers.push_back({sv.ep, sv.altPort});
-            if (tweak) tweak(c);
-            a[i] = std::make_unique<Agent>(c, w[i], test::kcpFactory());
+            if (tweak) tweak(c, i);
+            a[i] = std::make_unique<Agent>(c, w[i], [this, i, f = test::kcpFactory()](const StreamTransportInfo& info) {
+                made[i].push_back(info.transport);
+                return f(info);
+            });
             w[i].onRx = [this, i](const Host::Rx& rx) {
                 if (!deaf[i]) a[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now);
             };
@@ -2412,7 +2416,7 @@ static void testAgent() {
     // Caps: one punch at a time, one waiting; the waiting one gives up after
     // punchWait, the next is refused at once.
     {
-        AgentRig r(cg, cg, 6, [](AgentConfig& c) { c.maxPunches = 1; c.maxWaiting = 1; c.punchWait = Duration(5000); });
+        AgentRig r(cg, cg, 6, [](AgentConfig& c, int) { c.maxPunches = 1; c.maxWaiting = 1; c.punchWait = Duration(5000); });
         for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
         r.run(Duration(30000));
         const Endpoint nobody{0xCB0071FE, 4672};   // nobody punches back
@@ -2444,6 +2448,51 @@ static void testAgent() {
         CHECK(!r.a[0]->directPunchable());
         CHECK(r.a[1]->directPunchable());
         CHECK_EQ(r.a[0]->connect(r.a[1]->publicEndpoint(), tok, r.w.loop.now), SessionId(0));
+    }
+    // The stream transport: each PUNCH carries the sender's set, both peers
+    // take the highest bit in common, and with none the session is refused
+    // at the first packet instead of failing at the end of the budget.
+    {
+        CHECK_EQ(int(chooseTransport(0x03, 0x02)), 0x02);
+        CHECK_EQ(int(chooseTransport(0x03, 0x07)), 0x02);
+        CHECK_EQ(int(chooseTransport(0x01, 0x02)), 0);
+        CHECK_EQ(int(chooseTransport(0x03, 0)), 0x01);   // undeclared: natd before 0.1.4
+        CHECK_EQ(int(chooseTransport(0x02, 0)), 0);
+        proto::Punch p{tok, true, 0x05};
+        auto b = proto::encode(p);
+        CHECK_EQ(b.size(), proto::kPunchSize);
+        CHECK_EQ(int(b[7]), 0x05);
+        auto d = proto::decodePunch(b.data(), b.size());
+        CHECK(d && d->ack && d->transports == 0x05 && d->token == tok);
+        b[7] = 0;   // as natd 0.1.3 sent it
+        d = proto::decodePunch(b.data(), b.size());
+        CHECK(d && d->transports == 0);
+    }
+    struct Case { TransportSet t0, t1, agreed; };
+    for (const Case k : {Case{0x01, 0x01, 0x01}, Case{0x03, 0x02, 0x02}, Case{0x03, 0x03, 0x02}, Case{0x01, 0x02, 0}}) {
+        AgentRig r(cg, cg, 9, [k](AgentConfig& c, int i) { c.transports = i ? k.t1 : k.t0; });
+        for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
+        r.run(Duration(30000));
+        CHECK(r.a[0]->profileReady() && r.a[1]->profileReady());
+        const TimePoint t0 = r.w.loop.now;
+        const SessionId c = r.a[0]->connect(r.a[1]->publicEndpoint(), tok, t0);
+        const SessionId in = r.a[1]->accept(r.a[0]->publicEndpoint(), tok, t0);
+        CHECK(c != 0 && in != 0);
+        r.run(Duration(5000));   // well inside the 15 s a direct punch lasts
+        if (k.agreed) {
+            CHECK(r.saw(0, AgentEventType::Connected, c) && r.saw(1, AgentEventType::Incoming, in));
+            CHECK(r.made[0] == std::vector<TransportSet>{k.agreed} && r.made[1] == std::vector<TransportSet>{k.agreed});
+        } else {
+            CHECK(r.saw(0, AgentEventType::Closed, c) && r.saw(1, AgentEventType::Closed, in));
+            bool refused = true;
+            for (int i = 0; i < 2; ++i)
+                for (auto& e : r.ev[i])
+                    if (e.type == AgentEventType::Closed) refused = refused && e.error == SessionError::Refused;
+            CHECK(refused);
+            CHECK(r.made[0].empty() && r.made[1].empty());
+            CHECK_EQ(r.a[0]->stats().punchesRefused, 1u);
+            CHECK_EQ(r.a[0]->stats().punchesFailed, 0u);
+        }
     }
 }
 

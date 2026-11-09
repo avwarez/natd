@@ -44,6 +44,9 @@
 // PUNCH       peer <-> peer                           total 20 bytes
 //   txId = session token agreed through the signalling channel
 //   flags bit0 = ACK
+//   7  transports  the stream transports the sender runs (TransportSet, see
+//                  stream.hpp); 0 from a peer before natd 0.1.4, where the
+//                  byte was reserved: it runs the first one
 //
 // STREAM      peer <-> peer, after the punch           total 20 + payload
 //   txId = session token (the punch's)
@@ -116,6 +119,7 @@ struct ForwardReq {
 struct Punch {
     TxId token{};
     bool ack = false;
+    uint8_t transports = 0;   // TransportSet of the sender
 };
 
 // Payload points into the decoded buffer.

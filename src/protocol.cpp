@@ -75,7 +75,9 @@ Bytes encode(const ForwardReq& m) {
 }
 
 Bytes encode(const Punch& m) {
-    return header(MsgType::Punch, m.ack ? kPunchFlagAck : 0, m.token, kPunchSize);
+    Bytes b = header(MsgType::Punch, m.ack ? kPunchFlagAck : 0, m.token, kPunchSize);
+    b[7] = m.transports;
+    return b;
 }
 
 Bytes encodeStream(const TxId& token, uint8_t flags, const uint8_t* payload, size_t len) {
@@ -121,6 +123,7 @@ std::optional<Punch> decodePunch(const uint8_t* d, size_t len) {
     Punch m;
     m.token = readTx(d);
     m.ack = (d[6] & kPunchFlagAck) != 0;
+    m.transports = d[7];
     return m;
 }
 

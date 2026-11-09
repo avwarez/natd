@@ -148,7 +148,7 @@ struct Agent::Impl {
 
     SessionId open(bool incoming, const Endpoint& remote, std::optional<PeerInfo> info, const TxId& token,
                    std::shared_ptr<IDatagramObfuscator> obf, TimePoint now) {
-        if (!transport || !directOk(info) || sessions.size() >= cfg.maxSessions) return 0;
+        if (!transport || cfg.transports == 0 || !directOk(info) || sessions.size() >= cfg.maxSessions) return 0;
         if (incoming)
             for (auto& [id, s] : sessions)
                 if (s->token == token && !s->over) return 0;   // a request repeated while its punch is on
@@ -200,6 +200,7 @@ struct Agent::Impl {
         pc.token = s.token;
         pc.startAt = now;
         pc.primarySocket = cfg.discovery.primarySocket;
+        pc.transports = cfg.transports;
         pc.obfuscator = s.obfuscator;
         s.punch = std::make_unique<PunchSession>(pc, io);
         ++stats.punchesStarted;
@@ -217,6 +218,7 @@ struct Agent::Impl {
         sc.socket = s.punch->establishedSocket();
         sc.remote = s.punch->remoteEndpoint();
         sc.token = s.token;
+        sc.transport = s.punch->transport();
         sc.keepalive = cfg.keepalive;
         sc.randomBytes = cfg.randomBytes;
         sc.obfuscator = s.obfuscator;
@@ -322,6 +324,8 @@ struct Agent::Impl {
                     if (st == PunchState::Established) {
                         established(s, now);
                         next = now;   // the new stream wants a poll
+                    } else if (st == PunchState::Failed && s.punch->noCommonTransport()) {
+                        fail(s, SessionError::Refused);
                     } else if (st == PunchState::Failed) {
                         fail(s, SessionError::TimedOut);
                         ++stats.punchesFailed;

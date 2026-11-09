@@ -64,6 +64,9 @@ struct AgentConfig {
     Duration keepalive{20000};          // stream keepalive (>= 15 s, RFC 8085 §3.5; jittered)
     PunchLimits limits;
     StreamConfig stream;                // deadAfter, maxPayload (socket, remote, token: per session)
+    // The stream transports the factory makes (stream.hpp): sent in every
+    // PUNCH; the factory is then asked for the one both peers run.
+    TransportSet transports = kFirstTransport;
 };
 
 using SessionId = uint32_t;             // 0 = none
@@ -83,7 +86,8 @@ enum class AgentEventType : uint8_t {
 
 enum class SessionError : uint8_t {
     None,               // the peer closed the stream gracefully
-    Refused,            // no punch possible, or the caps were full
+    Refused,            // no punch possible, the caps were full, or the peer runs
+                        // none of our stream transports
     TimedOut,           // the punch did not get through, or waited too long
     Reset,              // the stream died (no datagram for keepalive x deadAfter)
     AddressChanged,     // a check found our public endpoint changed (checkEndpoint)

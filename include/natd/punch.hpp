@@ -14,6 +14,7 @@
 #pragma once
 
 #include "natd/discovery.hpp"
+#include "natd/stream.hpp"
 
 #include <memory>
 #include <vector>
@@ -139,6 +140,9 @@ struct PunchSessionConfig {
     TimePoint startAt{};           // agreed start time (local clock)
     uint32_t  remoteIp = 0;        // packets from other IPs are ignored
     SocketId  primarySocket = 0;
+    // The stream transports we run, in every PUNCH (see stream.hpp). A peer
+    // with none of them in common fails the session at its first packet.
+    TransportSet transports = kFirstTransport;
     // Optional: transform of every datagram of the session (null: plain natd
     // format). Give the Stream that follows the same one.
     std::shared_ptr<IDatagramObfuscator> obfuscator;
@@ -156,6 +160,10 @@ public:
     SocketId   establishedSocket() const;   // valid when Established
     Endpoint   remoteEndpoint() const;      // valid when Established
     Duration   keepalive() const;
+    // The stream transport both peers run (chooseTransport), when Established.
+    TransportSet transport() const;
+    // Failed because the peer runs none of our transports.
+    bool       noCommonTransport() const;
 
 private:
     struct Impl;

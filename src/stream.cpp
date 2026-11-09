@@ -55,11 +55,19 @@ struct Stream::Impl {
     bool alive() const { return st == StreamState::Open || st == StreamState::Closing; }
 };
 
+TransportSet chooseTransport(TransportSet ours, TransportSet theirs) {
+    const unsigned common = ours & (theirs ? theirs : kFirstTransport);
+    for (int b = 7; b >= 0; --b)
+        if (common & (1u << b)) return TransportSet(1u << b);
+    return 0;
+}
+
 Stream::Stream(StreamConfig cfg, const StreamTransportFactory& transport, IDatagramIo& io, TimePoint now)
     : impl_(std::make_unique<Impl>(std::move(cfg), io, now)) {
     Impl& m = *impl_;
     if (transport) {
         StreamTransportInfo info;
+        info.transport = m.cfg.transport;
         info.token = m.cfg.token;
         info.maxPayload = m.cfg.maxPayload;
         info.now = now;

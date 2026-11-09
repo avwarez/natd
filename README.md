@@ -181,9 +181,16 @@ are the stream's; `poll()` drives its timers; `flushed()` says that
 everything written was acknowledged (natd sends the FIN only then);
 `failed()` says it gave up (the stream is `Reset`). It sends through
 `info.output`, at most `info.maxPayload` bytes at a time, synchronously
-from inside these calls. Both peers must run the same transport: if an
-application may ever change it, it says which in the offer (`Offer::kind`).
-Changing the transport needs no new natd version.
+from inside these calls. Both peers must run the same transport. An
+application that may run more than one numbers them as bits of a
+`TransportSet` (`AgentConfig::transports`, for instance 0x01 for its first
+transport and 0x02 for a later one): every PUNCH carries the sender's set,
+both peers take the highest bit they have in common (`chooseTransport`) and
+the factory gets it in `info.transport`. That works on every signalling
+channel, also one with no room for it, and needs no message of its own; with
+nothing in common the session ends `Refused` at the peer's first packet. A
+peer before natd 0.1.4 declares nothing and is taken to run bit 0. Adding a
+transport needs no new natd version.
 
 A session belongs to the application from `connect()` or `accept()` until
 `release()`. It ends with `Connected` or `Incoming`, and later with
@@ -194,6 +201,7 @@ A session belongs to the application from `connect()` or `accept()` until
 ```cpp
 natd::AgentConfig cfg;
 cfg.discovery.primarySocket = mySocket;
+cfg.transports = 0x01;   // the transports the factory below makes (the default)
 // The application's transport, one per session (KCP in eMule, see
 // tests/kcp_transport.hpp for an example). natd calls it and carries what it
 // sends through info.output; it never reads the payloads.
