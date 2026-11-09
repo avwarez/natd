@@ -44,15 +44,9 @@
 // PUNCH       peer <-> peer                           total 20 bytes
 //   txId = session token agreed through the signalling channel
 //   flags bit0 = ACK
-//   7  transports  the stream transports the sender runs (TransportSet, see
-//                  stream.hpp); 0 from a peer before natd 0.1.4, where the
-//                  byte was reserved: it runs the first one
 //
-// STREAM      peer <-> peer, after the punch           total 20 + payload
-//   txId = session token (the punch's)
-//   flags bit0 = KEEPALIVE (no payload), bit1 = FIN (no payload)
-//   20 payload: what the application's transport sends (IStreamTransport),
-//      at most kMaxStreamPayload; natd does not read it
+// What goes over the path after the punch is the application's: natd has no
+// message for it (type 5, STREAM until natd 0.1.4, is not used).
 #pragma once
 
 #include "natd/types.hpp"
@@ -68,7 +62,6 @@ constexpr size_t  kProbeReqSize = 128;
 constexpr size_t  kProbeRespSize = 28;
 constexpr size_t  kForwardReqSize = 28;
 constexpr size_t  kPunchSize = 20;
-constexpr size_t  kMaxStreamPayload = 1400;
 constexpr uint32_t kMaxDelayMs = 300000;
 
 enum class MsgType : uint8_t {
@@ -76,7 +69,6 @@ enum class MsgType : uint8_t {
     ProbeResp = 2,
     ForwardReq = 3,
     Punch = 4,
-    Stream = 5,
 };
 
 enum ReplyMask : uint8_t {
@@ -95,8 +87,6 @@ enum Caps : uint8_t {
 };
 
 constexpr uint8_t kPunchFlagAck = 0x01;
-constexpr uint8_t kStreamFlagKeepalive = 0x01;
-constexpr uint8_t kStreamFlagFin = 0x02;
 
 struct ProbeReq {
     TxId     txId{};
@@ -119,15 +109,6 @@ struct ForwardReq {
 struct Punch {
     TxId token{};
     bool ack = false;
-    uint8_t transports = 0;   // TransportSet of the sender
-};
-
-// Payload points into the decoded buffer.
-struct StreamMsg {
-    TxId           token{};
-    uint8_t        flags = 0;
-    const uint8_t* payload = nullptr;
-    size_t         len = 0;
 };
 
 using Bytes = std::vector<uint8_t>;
@@ -141,12 +122,10 @@ Bytes encode(const ProbeReq&);
 Bytes encode(const ProbeResp&);
 Bytes encode(const ForwardReq&);
 Bytes encode(const Punch&);
-Bytes encodeStream(const TxId& token, uint8_t flags, const uint8_t* payload, size_t len);
 
 std::optional<ProbeReq>   decodeProbeReq(const uint8_t* data, size_t len);
 std::optional<ProbeResp>  decodeProbeResp(const uint8_t* data, size_t len);
 std::optional<ForwardReq> decodeForwardReq(const uint8_t* data, size_t len);
 std::optional<Punch>      decodePunch(const uint8_t* data, size_t len);
-std::optional<StreamMsg>  decodeStream(const uint8_t* data, size_t len);
 
 } // namespace natd::proto

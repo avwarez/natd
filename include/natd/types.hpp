@@ -66,12 +66,11 @@ public:
     virtual bool send(SocketId, const Endpoint& to, const uint8_t* data, size_t len) = 0;
 };
 
-// Optional obfuscation of a session's datagrams (PunchSession, Stream), so
+// Optional obfuscation of a punch session's datagrams (PunchSession), so
 // that natd's wire format ("NATD" header, token) is not recognisable on the
 // path. natd does no cryptography: the application supplies the transform
-// (for instance the obfuscation it already uses for its own traffic), shared
-// by the punch and the stream of the same session. Obfuscation, not
-// secrecy: whoever knows the keys' inputs can read.
+// (for instance the obfuscation it already uses for its own traffic).
+// Obfuscation, not secrecy: whoever knows the keys' inputs can read.
 class IDatagramObfuscator {
 public:
     virtual ~IDatagramObfuscator() = default;

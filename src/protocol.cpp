@@ -47,7 +47,7 @@ bool isNatdPacket(const uint8_t* d, size_t len) {
 
 std::optional<MsgType> peekType(const uint8_t* d, size_t len) {
     if (!isNatdPacket(d, len)) return std::nullopt;
-    if (d[5] < 1 || d[5] > 5) return std::nullopt;
+    if (d[5] < 1 || d[5] > 4) return std::nullopt;
     return MsgType(d[5]);
 }
 
@@ -75,16 +75,7 @@ Bytes encode(const ForwardReq& m) {
 }
 
 Bytes encode(const Punch& m) {
-    Bytes b = header(MsgType::Punch, m.ack ? kPunchFlagAck : 0, m.token, kPunchSize);
-    b[7] = m.transports;
-    return b;
-}
-
-Bytes encodeStream(const TxId& token, uint8_t flags, const uint8_t* payload, size_t len) {
-    if (len > kMaxStreamPayload) len = 0;
-    Bytes b = header(MsgType::Stream, flags, token, kHeaderSize + len);
-    if (len) std::memcpy(b.data() + kHeaderSize, payload, len);
-    return b;
+    return header(MsgType::Punch, m.ack ? kPunchFlagAck : 0, m.token, kPunchSize);
 }
 
 std::optional<ProbeReq> decodeProbeReq(const uint8_t* d, size_t len) {
@@ -123,18 +114,6 @@ std::optional<Punch> decodePunch(const uint8_t* d, size_t len) {
     Punch m;
     m.token = readTx(d);
     m.ack = (d[6] & kPunchFlagAck) != 0;
-    m.transports = d[7];
-    return m;
-}
-
-std::optional<StreamMsg> decodeStream(const uint8_t* d, size_t len) {
-    if (!checkHeader(d, len, MsgType::Stream, kHeaderSize) || len > kHeaderSize + kMaxStreamPayload) return std::nullopt;
-    StreamMsg m;
-    m.token = readTx(d);
-    m.flags = d[6] & (kStreamFlagKeepalive | kStreamFlagFin);
-    m.payload = d + kHeaderSize;
-    m.len = len - kHeaderSize;
-    if (m.flags && m.len) return std::nullopt;   // control messages carry no data
     return m;
 }
 

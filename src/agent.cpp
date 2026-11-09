@@ -18,23 +18,18 @@ const char* toString(AgentEventType t) {
     switch (t) {
         case AgentEventType::ProfileReady:    return "ProfileReady";
         case AgentEventType::EndpointChanged: return "EndpointChanged";
-        case AgentEventType::Incoming:        return "Incoming";
-        case AgentEventType::Connected:       return "Connected";
-        case AgentEventType::Readable:        return "Readable";
-        case AgentEventType::Writable:        return "Writable";
-        case AgentEventType::Closed:          return "Closed";
         case AgentEventType::EndpointChecked: return "EndpointChecked";
+        case AgentEventType::Punched:         return "Punched";
+        case AgentEventType::PunchFailed:     return "PunchFailed";
     }
     return "?";
 }
 
-const char* toString(SessionError e) {
+const char* toString(PunchError e) {
     switch (e) {
-        case SessionError::None:     return "None";
-        case SessionError::Refused:  return "Refused";
-        case SessionError::TimedOut: return "TimedOut";
-        case SessionError::Reset:    return "Reset";
-        case SessionError::AddressChanged: return "AddressChanged";
+        case PunchError::None:     return "None";
+        case PunchError::Refused:  return "Refused";
+        case PunchError::TimedOut: return "TimedOut";
     }
     return "?";
 }
@@ -76,15 +71,11 @@ struct Session {
     std::shared_ptr<IDatagramObfuscator> obfuscator;
     TimePoint queuedAt{};
     std::unique_ptr<PunchSession> punch;
-    std::unique_ptr<Stream> stream;
-    bool released = false;
-    TimePoint releasedAt{};
-    bool over = false;                      // nothing more will happen on it
-    SessionError error = SessionError::None;
-    bool open = false;                      // Connected/Incoming was queued
-    bool wantWrite = false;                 // a write() found the window full
-    bool readSignalled = false;             // a Readable is out, no read() since
-    bool closeSignalled = false;
+    PunchStrategy strategy = PunchStrategy::Infeasible;
+    bool punched = false;                   // Punched was queued
+    bool taken = false;                     // the result went to the application
+    TimePoint lingerUntil{};                // taken: the punch answers late PUNCHes until then
+    bool over = false;                      // failed: PunchFailed was queued
 };
 
 } // namespace
@@ -99,22 +90,14 @@ struct Agent::Impl {
     std::unique_ptr<QuickCheck> check;
     bool checkedOnce = false;
     TimePoint lastCheck{};
-    bool closeIfChanged = false;
     QuickCheckResult lastCheckResult = QuickCheckResult::Pending;
     std::map<SessionId, std::unique_ptr<Session>> sessions;
-    // Open streams by (socket, remote endpoint): a datagram finds its stream
-    // in one lookup. A stream accepts only that pair, so nothing is missed.
-    std::map<std::pair<SocketId, uint64_t>, SessionId> streamIndex;
-    static uint64_t epKey(const Endpoint& e) { return uint64_t(e.ip) << 16 | e.port; }
     TimePoint nextAt = TimePoint::max();   // see Agent::nextPoll()
     void touch(TimePoint now) { nextAt = std::min(nextAt, now); }
-    // Every removal of a session goes through here (index and counters).
     void erase(SessionId id) {
         auto it = sessions.find(id);
         if (it == sessions.end()) return;
-        Session& s = *it->second;
-        if (s.obfuscator) --obfuscated;
-        if (s.stream) streamIndex.erase({s.stream->config().socket, epKey(s.stream->config().remote)});
+        if (it->second->obfuscator) --obfuscated;
         sessions.erase(it);
     }
     std::deque<SessionId> waiting;
@@ -123,32 +106,31 @@ struct Agent::Impl {
     size_t obfuscated = 0;                  // sessions with an obfuscator, not freed
     AgentStats stats;
 
-    StreamTransportFactory transport;
-    Impl(AgentConfig c, IDatagramIo& i, StreamTransportFactory t) : cfg(std::move(c)), io(i), transport(std::move(t)) {}
+    Impl(AgentConfig c, IDatagramIo& i) : cfg(std::move(c)), io(i) {}
 
     Session* find(SessionId id) const {
         auto it = sessions.find(id);
         return it == sessions.end() ? nullptr : it->second.get();
     }
-    void emit(AgentEventType t, SessionId id = 0, SessionError e = SessionError::None) {
+    void emit(AgentEventType t, SessionId id = 0, PunchError e = PunchError::None) {
         events.push_back(AgentEvent{t, id, e});
     }
     size_t punching() const {
         size_t n = 0;
-        for (auto& [id, s] : sessions) n += s->punch && !s->stream && !s->over;
+        for (auto& [id, s] : sessions) n += s->punch && !s->punched && !s->over;
         return n;
     }
-    void fail(Session& s, SessionError e) {
+    void fail(Session& s, PunchError e) {
         if (s.over) return;
-        if (e == SessionError::Refused) ++stats.punchesRefused;
+        if (e == PunchError::Refused) ++stats.punchesRefused;
         s.over = true;
-        s.error = e;
         s.punch.reset();
+        emit(AgentEventType::PunchFailed, s.id, e);
     }
 
     SessionId open(bool incoming, const Endpoint& remote, std::optional<PeerInfo> info, const TxId& token,
                    std::shared_ptr<IDatagramObfuscator> obf, TimePoint now) {
-        if (!transport || cfg.transports == 0 || !directOk(info) || sessions.size() >= cfg.maxSessions) return 0;
+        if (!directOk(info)) return 0;
         if (incoming)
             for (auto& [id, s] : sessions)
                 if (s->token == token && !s->over) return 0;   // a request repeated while its punch is on
@@ -163,9 +145,9 @@ struct Agent::Impl {
         if (p->obfuscator) ++obfuscated;
         Session& s = *p;
         sessions[s.id] = std::move(p);
-        startPunch(s, now);
-        if (s.over && s.error == SessionError::Refused && !s.punch) {
+        if (!startPunch(s, now)) {
             // refused at once: the caller hears it from the return value
+            ++stats.punchesRefused;
             erase(s.id);
             return 0;
         }
@@ -179,13 +161,14 @@ struct Agent::Impl {
         return ready && profile.predictability == Predictability::Stable && profile.publicEndpoint.valid();
     }
 
-    void startPunch(Session& s, TimePoint now) {
+    // False: no punch possible, or no room to wait for one.
+    bool startPunch(Session& s, TimePoint now) {
         if (punching() >= cfg.maxPunches) {
-            if (waiting.size() >= cfg.maxWaiting) { fail(s, SessionError::Refused); return; }
+            if (waiting.size() >= cfg.maxWaiting) return false;
             ++stats.punchesQueued;
             s.queuedAt = now;
             waiting.push_back(s.id);
-            return;
+            return true;
         }
         PunchSessionConfig pc;
         if (s.remoteInfo) {
@@ -196,14 +179,15 @@ struct Agent::Impl {
             pc.plan = planDirect(profile, s.remote, cfg.limits);
             pc.remoteIp = s.remote.ip;
         }
-        if (pc.plan.strategy == PunchStrategy::Infeasible) { fail(s, SessionError::Refused); return; }
+        if (pc.plan.strategy == PunchStrategy::Infeasible) return false;
         pc.token = s.token;
         pc.startAt = now;
         pc.primarySocket = cfg.discovery.primarySocket;
-        pc.transports = cfg.transports;
         pc.obfuscator = s.obfuscator;
+        s.strategy = pc.plan.strategy;
         s.punch = std::make_unique<PunchSession>(pc, io);
         ++stats.punchesStarted;
+        return true;
     }
 
     PeerInfo localPeerInfo() const {
@@ -213,33 +197,11 @@ struct Agent::Impl {
         return pi;
     }
 
-    void established(Session& s, TimePoint now) {
-        StreamConfig sc = cfg.stream;
-        sc.socket = s.punch->establishedSocket();
-        sc.remote = s.punch->remoteEndpoint();
-        sc.token = s.token;
-        sc.transport = s.punch->transport();
-        sc.keepalive = cfg.keepalive;
-        sc.randomBytes = cfg.randomBytes;
-        sc.obfuscator = s.obfuscator;
-        s.remote = sc.remote;
-        s.stream = std::make_unique<Stream>(sc, transport, io, now);
-        streamIndex[{sc.socket, epKey(sc.remote)}] = s.id;
-        s.punch.reset();
-        ++stats.punchesEstablished;
-        if (s.released) { s.stream->close(now); return; }
-        s.open = true;
-        emit(s.incoming ? AgentEventType::Incoming : AgentEventType::Connected, s.id);
-    }
-
-    void startCheck(bool closeStreams, TimePoint now) {
+    void startCheck(TimePoint now) {
         if (!ready) return;
-        closeIfChanged = closeIfChanged || closeStreams;
-        if (check || (checkedOnce && now - lastCheck < cfg.checkReuse)) {
-            if (!check) {
-                closeIfChanged = false;   // found the same, or updated, a moment ago
-                ++stats.endpointChecksReused;
-            }
+        if (check) return;
+        if (checkedOnce && now - lastCheck < cfg.checkReuse) {
+            ++stats.endpointChecksReused;   // found the same, or updated, a moment ago
             return;
         }
         ++stats.endpointChecks;
@@ -271,102 +233,51 @@ struct Agent::Impl {
                     profile.publicEndpoint = check->observed();
                     ++stats.endpointChanges;
                     emit(AgentEventType::EndpointChanged);
-                    if (closeIfChanged)
-                        for (auto& [id, s] : sessions)
-                            if (s->stream && !s->over) {
-                                fail(*s, SessionError::AddressChanged);
-                                ++stats.streamsAddressChanged;
-                            }
                 }
                 check.reset();
                 lastCheck = now;
                 checkedOnce = true;
-                closeIfChanged = false;
             }
         }
         // requests that waited for a free punch session
         while (!waiting.empty() && punching() < cfg.maxPunches) {
             Session* s = find(waiting.front());
             waiting.pop_front();
-            if (!s || s->over || s->released) continue;
+            if (!s || s->over) continue;
             if (now - s->queuedAt >= cfg.punchWait) {
-                fail(*s, SessionError::TimedOut);
+                fail(*s, PunchError::TimedOut);
                 ++stats.punchesRefused;
+            } else if (!startPunch(*s, now)) {
+                fail(*s, PunchError::Refused);
             }
-            else startPunch(*s, now);
         }
         for (SessionId id : waiting)
             if (Session* s = find(id)) next = std::min(next, s->queuedAt + cfg.punchWait);
-
-        bool dead = false;
         for (auto it = sessions.begin(); it != sessions.end();) {
             Session& s = *it->second;
-            if (!s.over) {
-                if (s.stream) {
-                    next = std::min(next, s.stream->poll(now));
-                    const StreamState st = s.stream->state();
-                    if (st == StreamState::Dead) {
-                        // a lost connection; our own endpoint may have changed (the NAT lost
-                        // its mappings, a new address): checked, so that the next punch is right
-                        fail(s, SessionError::Reset);
-                        ++stats.streamsDead;
-                        dead = true;
-                    } else if (st == StreamState::Closed) {
-                        s.over = true;
-                    }
-                    if (s.released && !s.over) {
-                        if (now - s.releasedAt >= cfg.linger) s.over = true;
-                        else next = std::min(next, s.releasedAt + cfg.linger);
-                    }
-                } else if (s.punch) {
-                    next = std::min(next, s.punch->poll(now));
-                    const PunchState st = s.punch->state();
-                    if (st == PunchState::Established) {
-                        established(s, now);
-                        next = now;   // the new stream wants a poll
-                    } else if (st == PunchState::Failed && s.punch->noCommonTransport()) {
-                        fail(s, SessionError::Refused);
-                    } else if (st == PunchState::Failed) {
-                        fail(s, SessionError::TimedOut);
-                        ++stats.punchesFailed;
-                    }
+            if (s.punch && !s.punched && !s.over) {
+                next = std::min(next, s.punch->poll(now));
+                const PunchState st = s.punch->state();
+                if (st == PunchState::Established) {
+                    s.punched = true;
+                    s.remote = s.punch->remoteEndpoint();
+                    ++stats.punchesEstablished;
+                    emit(AgentEventType::Punched, s.id);
+                } else if (st == PunchState::Failed) {
+                    fail(s, PunchError::TimedOut);
+                    ++stats.punchesFailed;
                 }
             }
-            if (!s.released) signal(s);
-            if (s.released && s.over) {
-                const SessionId gone = s.id;
-                ++it;
-                erase(gone);
-            } else {
-                ++it;
-            }
+            if (s.taken && now < s.lingerUntil) next = std::min(next, s.lingerUntil);
+            const SessionId id = s.id;
+            ++it;
+            if (sessions.at(id)->over || (sessions.at(id)->taken && now >= sessions.at(id)->lingerUntil)) erase(id);
         }
-        if (dead) startCheck(false, now);
         return next;
-    }
-
-    void signal(Session& s) {
-        if (s.stream && s.open) {
-            if (!s.readSignalled && s.stream->readable() > 0) {
-                s.readSignalled = true;
-                emit(AgentEventType::Readable, s.id);
-            }
-            if (s.wantWrite && !s.over && s.stream->writable()) {
-                s.wantWrite = false;
-                emit(AgentEventType::Writable, s.id);
-            }
-        }
-        if (s.closeSignalled) return;
-        const bool peerDone = s.stream && (s.stream->peerClosed() || s.stream->state() == StreamState::Closed);
-        if (!s.over && !peerDone) return;
-        if (s.stream && s.stream->readable() > 0) return;   // what arrived before the end is read first
-        s.closeSignalled = true;
-        emit(AgentEventType::Closed, s.id, s.over ? s.error : SessionError::None);
     }
 };
 
-Agent::Agent(AgentConfig cfg, IDatagramIo& io, StreamTransportFactory transport)
-    : impl_(std::make_unique<Impl>(std::move(cfg), io, std::move(transport))) {}
+Agent::Agent(AgentConfig cfg, IDatagramIo& io) : impl_(std::make_unique<Impl>(std::move(cfg), io)) {}
 Agent::~Agent() = default;
 
 void Agent::start(TimePoint now, std::optional<std::vector<StunEndpoint>> servers) {
@@ -395,16 +306,11 @@ bool Agent::onDatagram(SocketId sock, const Endpoint& from, const uint8_t* d, si
     bool used = false;
     if (m.discovery && m.discovery->onDatagram(sock, from, d, len, now)) used = true;
     if (!used && m.check && m.check->onDatagram(sock, from, d, len, now)) used = true;
-    if (!used) {
-        auto ix = m.streamIndex.find({sock, Impl::epKey(from)});
-        if (ix != m.streamIndex.end())
-            if (Session* s = m.find(ix->second)) used = s->stream->onDatagram(sock, from, d, len, now);
-    }
-    // Punches in progress (at most maxPunches): a punch may hear from more
-    // than one endpoint, so they are asked in turn.
+    // Punches in progress (at most maxPunches), and those handed over a moment
+    // ago: a punch may hear from more than one endpoint, so they are asked in turn.
     for (auto it = m.sessions.begin(); !used && it != m.sessions.end(); ++it) {
         Session& s = *it->second;
-        if (s.punch && !s.stream) used = s.punch->onDatagram(sock, from, d, len, now);
+        if (s.punch) used = s.punch->onDatagram(sock, from, d, len, now);
     }
     if (used) m.nextAt = m.step(now);
     return used || stun::isStunPacket(d, len) || proto::isNatdPacket(d, len);
@@ -429,8 +335,8 @@ PeerInfo Agent::localPeerInfo() const { return impl_->localPeerInfo(); }
 QuickCheckResult Agent::lastCheckResult() const { return impl_->lastCheckResult; }
 bool Agent::checking() const { return impl_->check != nullptr; }
 
-void Agent::checkEndpoint(TimePoint now, bool closeIfChanged) {
-    impl_->startCheck(closeIfChanged, now);
+void Agent::checkEndpoint(TimePoint now) {
+    impl_->startCheck(now);
     impl_->touch(now);
 }
 
@@ -461,54 +367,51 @@ SessionId Agent::accept(const PeerInfo& remote, const TxId& token, TimePoint now
 
 SessionPhase Agent::phase(SessionId id) const {
     const Session* s = impl_->find(id);
-    if (!s) return SessionPhase::None;
-    if (s->over) return SessionPhase::Over;
-    if (s->stream) return s->released || s->stream->state() == StreamState::Closing ? SessionPhase::Closing
-                                                                                     : SessionPhase::Open;
+    if (!s || s->over || s->taken) return SessionPhase::None;
+    if (s->punched) return SessionPhase::Punched;
     return s->punch ? SessionPhase::Punching : SessionPhase::Waiting;
 }
 
 Endpoint Agent::remote(SessionId id) const {
     const Session* s = impl_->find(id);
-    return s ? s->remote : Endpoint{};
+    return s && !s->taken ? s->remote : Endpoint{};
 }
 
-size_t Agent::write(SessionId id, const uint8_t* d, size_t len, TimePoint now) {
-    Session* s = impl_->find(id);
-    if (!s || !s->stream || s->over || s->released) return 0;
-    const size_t n = s->stream->write(d, len, now);
-    if (n == 0 && len > 0) s->wantWrite = true;
-    impl_->touch(now);
-    return n;
-}
-
-size_t Agent::read(SessionId id, uint8_t* out, size_t max) {
-    Session* s = impl_->find(id);
-    if (!s || !s->stream || s->released) return 0;
-    s->readSignalled = false;
-    const size_t n = s->stream->read(out, max);
-    impl_->signal(*s);   // more left: Readable again; the end once it is all read
-    return n;
-}
-
-size_t Agent::readable(SessionId id) const {
-    const Session* s = impl_->find(id);
-    return s && s->stream ? s->stream->readable() : 0;
-}
-
-void Agent::release(SessionId id, TimePoint now) {
+std::optional<PunchResult> Agent::takeResult(SessionId id, TimePoint now) {
     Impl& m = *impl_;
     Session* s = m.find(id);
-    if (!s || s->released) return;
-    s->released = true;
-    s->releasedAt = now;
-    if (s->stream && !s->over && s->stream->state() == StreamState::Open) s->stream->close(now);
-    else if (!s->stream) s->over = true;
-    if (s->over) m.erase(id);
+    if (!s || !s->punched || s->taken) return std::nullopt;
+    PunchResult r;
+    r.socket = s->punch->establishedSocket();
+    r.local = m.io.localEndpoint(r.socket);
+    r.remote = s->punch->remoteEndpoint();
+    r.keepalive = s->punch->keepalive();
+    r.mappingLifetime = mappingLifetime(m.profile);
+    r.strategy = s->strategy;
+    r.incoming = s->incoming;
+    r.token = s->token;
+    s->taken = true;
+    s->lingerUntil = now + m.cfg.limits.budget;
+    m.touch(now);
+    return r;
+}
+
+void Agent::cancel(SessionId id, TimePoint now) {
+    Impl& m = *impl_;
+    Session* s = m.find(id);
+    if (!s || s->taken) return;
+    // a punched path nobody took: its socket, if natd opened it, is still natd's
+    if (s->punched && s->punch->establishedSocket() != m.cfg.discovery.primarySocket)
+        m.io.closeSocket(s->punch->establishedSocket());
+    m.erase(id);
     m.touch(now);
 }
 
-size_t Agent::sessionCount() const { return impl_->sessions.size(); }
+size_t Agent::sessionCount() const {
+    size_t n = 0;
+    for (auto& [id, s] : impl_->sessions) n += !s->taken && !s->over;
+    return n;
+}
 const AgentStats& Agent::stats() const { return impl_->stats; }
 
 } // namespace natd

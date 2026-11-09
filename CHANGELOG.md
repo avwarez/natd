@@ -12,6 +12,47 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-09
+
+natd now ends where the hole is open: a punch that gets through hands the
+application the path and everything it needs to use it, and what goes over
+it is the application's. natd has no dependencies, also in its tests.
+
+### API
+- `Agent`: the events are `ProfileReady`, `EndpointChanged`,
+  `EndpointChecked`, `Punched` and `PunchFailed` (with `PunchError::Refused`
+  or `TimedOut`). After `Punched`, `takeResult()` hands over a
+  `PunchResult` once: the socket (the primary one, or one natd opened, which
+  becomes the application's), the local and remote endpoints, the keepalive
+  interval, the mapping lifetime, the strategy, the token. `cancel()` gives
+  up on a session not handed over. `Agent(cfg, io)`: no transport factory.
+  `checkEndpoint(now)`: no `closeIfChanged`. `SessionPhase` is `None`,
+  `Waiting`, `Punching`, `Punched`.
+- Removed: `Stream`, `StreamConfig`, `StreamState`, `IStreamTransport`,
+  `StreamTransportInfo`, `StreamTransportFactory`, `TransportSet`,
+  `chooseTransport()` (`natd/stream.hpp`), `Agent::read()`, `write()`,
+  `readable()`, `release()`, the events `Connected`, `Incoming`, `Readable`,
+  `Writable`, `Closed`, `SessionError`, `AgentConfig::maxSessions`,
+  `linger`, `keepalive`, `stream`, `transports`, the counters `streamsDead`
+  and `streamsAddressChanged`, `PunchSessionConfig::transports`,
+  `PunchSession::transport()` and `noCommonTransport()`.
+
+### Wire format
+- The STREAM message (type 5) is gone, and PUNCH byte 7 is reserved again
+  (0.1.4 carried the transports there). The wire version stays 1: probes and
+  punches are unchanged from 0.1.3.
+
+### Behaviour
+- A punch handed over still answers the peer's PUNCH packets until the
+  punch budget ends, for a last ACK that was lost.
+- A path that went silent no longer starts an endpoint check by itself: the
+  application, which now knows when its path is dead, calls
+  `checkEndpoint()`.
+
+### Tests
+- The KCP copy in `tests/kcp` and its adapter are gone, with the stream
+  checks and the stream fuzz target.
+
 ## [0.1.4] - 2026-11-09
 
 ### API

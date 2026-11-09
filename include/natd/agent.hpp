@@ -2,13 +2,19 @@
 // Copyright (C) 2026 avwarez
 
 // natd/agent.hpp — one object for an application: discovery, endpoint
-// checks, punch sessions and the streams over them (sans-I/O).
+// checks and punch sessions (sans-I/O).
 //
 // The Agent puts together what every application otherwise writes around
-// NatDiscovery, QuickCheck, PunchSession and Stream: the life of the profile,
-// a queue and caps for the punch sessions, the move from punch to stream,
-// keepalives, a graceful close that lingers, and the events the application
+// NatDiscovery, QuickCheck and PunchSession: the life of the profile, a
+// queue and caps for the punch sessions, and the events the application
 // reacts to. It owns no socket, thread or timer, like the rest of natd.
+//
+// natd ends where the hole is open. A punch that gets through hands the
+// application a PunchResult: the socket, both endpoints, how often the path
+// must carry something to stay open, and how long our mapping lives. What
+// goes over the path, how it is kept open and when it ends are the
+// application's: natd never sees its datagrams again (but for answering the
+// peer's last PUNCH packets for a moment, see takeResult()).
 //
 // Split of responsibilities. natd knows how; the application decides
 // whether, when and with whom:
@@ -19,13 +25,11 @@
 //   - it decides when a punch is worth it, carries the offer (encodeOffer)
 //     over its own signalling channel, and chooses the key the session token
 //     is derived from (tokenFrom); natd never reads the channel;
-//   - it says when the public endpoint may have changed (checkEndpoint) and
-//     what to do once it did (EndpointChanged); natd closes only the streams
-//     whose path is gone;
-//   - it supplies the stream transport (IStreamTransport: reliability, flow
-//     and congestion control), which natd carries but never reads, and the
-//     obfuscation of a session, if any (IDatagramObfuscator);
-//   - it runs its own protocol over the stream bytes.
+//   - it says when the public endpoint may have changed (checkEndpoint: a
+//     lost connection, a path of its own that died) and what to do once it
+//     did (EndpointChanged);
+//   - it runs whatever it likes over the punched path, and the obfuscation
+//     of the punch, if any (IDatagramObfuscator).
 //
 // Events are queued and read with nextEvent(): the Agent never calls back
 // into the application, so nothing re-enters it from inside onDatagram() or
@@ -35,7 +39,6 @@
 
 #include "natd/discovery.hpp"
 #include "natd/punch.hpp"
-#include "natd/stream.hpp"
 
 #include <array>
 #include <memory>
@@ -58,15 +61,8 @@ struct AgentConfig {
     size_t   maxPunches = 4;            // punch sessions at once
     size_t   maxWaiting = 16;           // requests waiting for a free punch session
     Duration punchWait{10000};          // how long one may wait (the other side punches for 15 s)
-    size_t   maxSessions = 64;          // punches and streams together
-    Duration linger{10000};             // a closed stream, until its FIN is through
     Duration checkReuse{60000};         // an endpoint check stands this long
-    Duration keepalive{20000};          // stream keepalive (>= 15 s, RFC 8085 §3.5; jittered)
     PunchLimits limits;
-    StreamConfig stream;                // deadAfter, maxPayload (socket, remote, token: per session)
-    // The stream transports the factory makes (stream.hpp): sent in every
-    // PUNCH; the factory is then asked for the one both peers run.
-    TransportSet transports = kFirstTransport;
 };
 
 using SessionId = uint32_t;             // 0 = none
@@ -74,43 +70,57 @@ using SessionId = uint32_t;             // 0 = none
 enum class AgentEventType : uint8_t {
     ProfileReady,       // discovery has a first result: profile(), directPunchable()
     EndpointChanged,    // a check found another public endpoint: publicEndpoint()
-    Incoming,           // a session from accept() is through: its stream is open
-    Connected,          // a session from connect() is through: its stream is open
-    Readable,           // read() has bytes (once, until a read())
-    Writable,           // write() takes bytes again, after it returned 0
-    Closed,             // the session is over, `error` says why; it comes after the
-                        // bytes that arrived before the end were read. Then release().
     EndpointChecked,    // an endpoint check ended: lastCheckResult() (Valid, Changed:
                         // EndpointChanged follows, Unreachable)
+    Punched,            // a session from connect() or accept() got through: takeResult()
+    PunchFailed,        // it did not, `error` says why; the session is gone
 };
 
-enum class SessionError : uint8_t {
-    None,               // the peer closed the stream gracefully
-    Refused,            // no punch possible, the caps were full, or the peer runs
-                        // none of our stream transports
+enum class PunchError : uint8_t {
+    None,
+    Refused,            // no punch possible, or the caps were full
     TimedOut,           // the punch did not get through, or waited too long
-    Reset,              // the stream died (no datagram for keepalive x deadAfter)
-    AddressChanged,     // a check found our public endpoint changed (checkEndpoint)
 };
 
 struct AgentEvent {
     AgentEventType type;
     SessionId      session = 0;
-    SessionError   error = SessionError::None;
+    PunchError     error = PunchError::None;
 };
 
 // Counters, for the application's diagnostics.
 struct AgentStats {
     uint64_t punchesStarted = 0, punchesQueued = 0, punchesEstablished = 0, punchesFailed = 0;
     uint64_t punchesRefused = 0;        // at once, or given up in the queue
-    uint64_t streamsDead = 0, streamsAddressChanged = 0;
     uint64_t endpointChecks = 0, endpointChecksReused = 0, endpointChanges = 0;
 };
 
 const char* toString(AgentEventType);
-const char* toString(SessionError);
+const char* toString(PunchError);
 
-enum class SessionPhase : uint8_t { None, Waiting, Punching, Open, Closing, Over };
+// What a punch hands over: from here the path is the application's.
+struct PunchResult {
+    // The punched socket: the primary one, or one natd opened for the punch,
+    // which is now the application's (it closes it with IDatagramIo::closeSocket).
+    SocketId  socket = 0;
+    Endpoint  local;               // that socket's local endpoint
+    // The peer's endpoint the punch got through to: send there, and take on
+    // that socket only what comes from there.
+    Endpoint  remote;
+    // Send something on the path at least this often while it is idle, so
+    // that both NATs keep its mappings and filters (RFC 4787 REQ-6, RFC 8085
+    // §3.5: at least 15 s, shorter when our profile measured a shorter
+    // binding lifetime).
+    Duration  keepalive{15000};
+    // How long our mapping survives with nothing sent (mappingLifetime() of
+    // our profile); none when not known.
+    std::optional<Duration> mappingLifetime;
+    PunchStrategy strategy = PunchStrategy::Direct;
+    bool      incoming = false;    // from accept()
+    TxId      token{};             // the session's
+};
+
+enum class SessionPhase : uint8_t { None, Waiting, Punching, Punched };
 
 // The offer an application carries over its signalling channel to ask for a
 // punch: "NATD", a version, an application-defined kind and a random nonce
@@ -128,9 +138,7 @@ TxId tokenFrom(const uint8_t* key, size_t keyLen, uint64_t nonce);
 
 class Agent {
 public:
-    // transport: the application's stream transport, one per session (see
-    // stream.hpp). Required: without it connect() and accept() refuse.
-    Agent(AgentConfig cfg, IDatagramIo& io, StreamTransportFactory transport);
+    Agent(AgentConfig cfg, IDatagramIo& io);
     ~Agent();
     Agent(const Agent&) = delete;
     Agent& operator=(const Agent&) = delete;
@@ -143,7 +151,7 @@ public:
 
     // Cheap test for a socket shared with the application's own protocol:
     // false means the datagram is surely not natd's (STUN, natd format, or an
-    // obfuscated session is open).
+    // obfuscated punch is on).
     bool mayBeOurs(const uint8_t* data, size_t len) const;
     // Every datagram of the primary socket and of the sockets natd opened.
     // True when it is natd's: consumed, or in natd's or STUN's format (a late
@@ -153,8 +161,8 @@ public:
     // Drive timers; returns the next time it wants to be called.
     TimePoint poll(TimePoint now);
     // When poll() is wanted next, also after the other calls: a datagram
-    // (onDatagram) or a start, connect, accept, write, release or endpoint
-    // check may want it earlier than the last poll() said (then: their now).
+    // (onDatagram) or a start, connect, accept, cancel or endpoint check may
+    // want it earlier than the last poll() said (then: their now).
     TimePoint nextPoll() const;
     bool nextEvent(AgentEvent& out);
 
@@ -169,10 +177,9 @@ public:
     PeerInfo localPeerInfo() const;
 
     // The public endpoint may have changed (the application lost a
-    // connection that shows it, or a network change). One check at a time,
-    // none within checkReuse of the last. closeIfChanged: the open streams
-    // end (AddressChanged) if it did change. A dead stream checks by itself.
-    void checkEndpoint(TimePoint now, bool closeIfChanged);
+    // connection that shows it, a punched path of its went silent, a network
+    // change). One check at a time, none within checkReuse of the last.
+    void checkEndpoint(TimePoint now);
     // The result of the last check that ended (Pending: none yet), and
     // whether one is running now.
     QuickCheckResult lastCheckResult() const;
@@ -180,10 +187,10 @@ public:
 
     // Sessions. connect() punches towards a peer that was sent an offer;
     // accept() answers an offer that came in. Both return 0 when refused at
-    // once; otherwise the session is the application's until release(), and
-    // ends with Connected or Incoming, or with Closed. A remote Endpoint
-    // means planDirect (both sides endpoint-independent); a PeerInfo means
-    // planPunch. accept() of a token already in progress returns 0.
+    // once; otherwise the session ends with Punched or PunchFailed. A remote
+    // Endpoint means planDirect (both sides endpoint-independent); a
+    // PeerInfo means planPunch. accept() of a token already in progress, or
+    // punched a moment ago, returns 0.
     SessionId connect(const Endpoint& remote, const TxId& token, TimePoint now,
                       std::shared_ptr<IDatagramObfuscator> obfuscator = nullptr);
     SessionId connect(const PeerInfo& remote, const TxId& token, TimePoint now,
@@ -195,17 +202,17 @@ public:
 
     SessionPhase phase(SessionId) const;
     Endpoint remote(SessionId) const;
-    // Stream I/O. write() takes what fits (0 = full: Writable follows);
-    // read() returns 0 when nothing is there (Readable follows when there is).
-    size_t write(SessionId, const uint8_t* data, size_t len, TimePoint now);
-    size_t read(SessionId, uint8_t* out, size_t max);
-    size_t readable(SessionId) const;
-    // The application is done with the session: no more events for it. An
-    // open stream closes gracefully (FIN once what was written is through,
-    // at most `linger`); a punch in progress stops.
-    void release(SessionId, TimePoint now);
+    // After Punched: the path, once. natd then keeps only the punch, to
+    // answer the peer's PUNCH packets on that path until the punch budget
+    // ends (its last ACK may have been lost); the session is no longer
+    // listed (phase None).
+    std::optional<PunchResult> takeResult(SessionId, TimePoint now);
+    // The application gives up on a session (waiting, punching, or punched
+    // and not taken): no more events, and the sockets natd opened for it are
+    // closed.
+    void cancel(SessionId, TimePoint now);
 
-    size_t sessionCount() const;
+    size_t sessionCount() const;              // waiting, punching, or punched and not taken
     const AgentStats& stats() const;
 
 private:

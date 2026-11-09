@@ -4,7 +4,6 @@
 // natd unit and simulation tests. Exit code 0 = all passed.
 #include "natd/natd.hpp"
 #include "simnet.hpp"
-#include "kcp_transport.hpp"
 #include "../src/sha256.hpp"
 
 #include <cstdio>
@@ -1681,200 +1680,9 @@ static void testPunch() {
 }
 
 
-// ---------------------------------------------------------------- stream
-static void testStream() {
-    std::puts("stream (KCP over a direct punch)");
-    // Codec
-    // SHA-256 (FIPS 180-4 test vectors: empty, "abc", 448 bits, one million 'a').
-    {
-        auto hex = [](const std::array<uint8_t, 32>& h) {
-            std::string s; char b[3];
-            for (uint8_t x : h) { std::snprintf(b, sizeof b, "%02x", x); s += b; }
-            return s;
-        };
-        auto H = [&](const std::string& m) { return hex(detail::sha256(reinterpret_cast<const uint8_t*>(m.data()), m.size())); };
-        CHECK(H("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        CHECK(H("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-        CHECK(H("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
-              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
-        CHECK(H(std::string(1000000, 'a')) == "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
-        // Padding edges (one or two final blocks), values from Python hashlib.
-        CHECK(H(std::string(55, 'x')) == "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072");
-        CHECK(H(std::string(56, 'x')) == "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e");
-        CHECK(H(std::string(63, 'x')) == "75220b47218278e656f2013bb8f0c455a25eaf01e86c64924e9d48d89776d6f2");
-        CHECK(H(std::string(64, 'x')) == "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c");
-        CHECK(H(std::string(65, 'x')) == "9537c5fdf120482f7d58d25e9ed583f52c02b4e304ea814db1633ad565aed7e9");
-        CHECK(H(std::string(119, 'x')) == "000b48d4edf0fa7bee3c6236ecd2785baa5db4eeb8bb54341b029e0d9fa5fb0c");
-        CHECK(H(std::string(120, 'x')) == "13f05a0b594787f5ecd315edc96141bd3243203d1b7d4f0836f37308b276ba98");
-    }
-    TxId tok = sessionTokenFrom(reinterpret_cast<const uint8_t*>("abc"), 3);
-    CHECK(tok == sessionTokenFrom(reinterpret_cast<const uint8_t*>("abc"), 3));
-    CHECK(tok != sessionTokenFrom(reinterpret_cast<const uint8_t*>("abd"), 3));
-    uint8_t pl[5] = {1, 2, 3, 4, 5};
-    auto b = proto::encodeStream(tok, 0, pl, 5);
-    CHECK_EQ(b.size(), size_t(25));
-    CHECK(proto::peekType(b.data(), b.size()) == proto::MsgType::Stream);
-    auto m = proto::decodeStream(b.data(), b.size());
-    CHECK(m && m->token == tok && m->len == 5 && m->payload[4] == 5 && m->flags == 0);
-    auto ka = proto::encodeStream(tok, proto::kStreamFlagKeepalive, nullptr, 0);
-    CHECK(proto::decodeStream(ka.data(), ka.size()) && proto::decodeStream(ka.data(), ka.size())->flags == 1);
-    b[6] = proto::kStreamFlagFin;   // control flag with data: rejected
-    CHECK(!proto::decodeStream(b.data(), b.size()));
-    std::vector<uint8_t> big(proto::kHeaderSize + proto::kMaxStreamPayload + 1, 0);
-    std::memcpy(big.data(), ka.data(), proto::kHeaderSize);
-    CHECK(!proto::decodeStream(big.data(), big.size()));
-    CHECK(!proto::decodePunch(ka.data(), ka.size()));
-
-    // planDirect: only with a Stable local mapping.
-    NatProfile stable;
-    stable.predictability = Predictability::Stable;
-    stable.keepaliveInterval = Duration(20000);
-    PunchPlan pd = planDirect(stable, Endpoint{0x01020304, 5000});
-    CHECK(pd.strategy == PunchStrategy::Direct && pd.targets.size() == 1 && pd.keepalive == Duration(20000));
-    // RFC 8085: one punch every 3 s at most, keepalives 15 s apart at least,
-    // unless a measured lifetime asks for less.
-    CHECK_EQ(pd.sendInterval, Duration(4000));
-    {
-        NatProfile fast = stable;
-        fast.punchInterval = Duration(1000);
-        fast.keepaliveInterval = Duration(5000);
-        PunchPlan pf = planDirect(fast, Endpoint{0x01020304, 5000});
-        CHECK_EQ(pf.sendInterval, Duration(3000));
-        CHECK_EQ(pf.keepalive, Duration(15000));
-        fast.lifetimeMeasured = true;
-        pf = planDirect(fast, Endpoint{0x01020304, 5000});
-        CHECK_EQ(pf.sendInterval, Duration(1000));
-        CHECK_EQ(pf.keepalive, Duration(5000));
-    }
-    NatProfile hard = stable;
-    hard.predictability = Predictability::Unpredictable;
-    CHECK(planDirect(hard, Endpoint{0x01020304, 5000}).strategy == PunchStrategy::Infeasible);
-
-    // Two CGNATs with endpoint-independent mapping and address+port dependent
-    // filtering; each peer only knows the other's endpoint as a third party
-    // saw it. 5% loss each way.
-    NatModel cg; cg.mapping = Map::EI; cg.filtering = Filt::APD; cg.alloc = Alloc::RandomFull;
-    Peers w(cg, cg, 77);
-    SocketId prim[2] = {*w[0].openSocket(4672), *w[1].openSocket(4672)};
-    Endpoint seen[2];
-    const uint32_t kThird = 0xC6336409;
-    uint64_t nOut = 0;
-    bool lossy = true;
-    for (int i = 0; i < 2; ++i) {
-        auto old = w[i].egress;
-        w[i].egress = [&, i, old](const Endpoint& src, const Endpoint& to, std::vector<uint8_t> d, const Endpoint* fa) {
-            if (to.ip == kThird) { seen[i] = src; return; }
-            if (lossy && ++nOut % 20 == 0) return;
-            old(src, to, std::move(d), fa);
-        };
-        uint8_t hi = 1;
-        w[i].send(prim[i], Endpoint{kThird, 9}, &hi, 1);
-    }
-    w.run([](TimePoint) { return TimePoint::max(); }, w.loop.now + Duration(50));
-    std::unique_ptr<PunchSession> ps[2];
-    std::unique_ptr<Stream> st[2];
-    for (int i = 0; i < 2; ++i) {
-        PunchSessionConfig c;
-        c.plan = planDirect(stable, seen[1 - i]);
-        c.token = tok;
-        c.startAt = w.loop.now + Duration(i * 80);   // the relayed side starts later
-        c.remoteIp = seen[1 - i].ip;
-        c.primarySocket = prim[i];
-        ps[i] = std::make_unique<PunchSession>(c, w[i]);
-    }
-    bool deaf[2] = {false, false};
-    for (int i = 0; i < 2; ++i)
-        w[i].onRx = [&, i](const Host::Rx& rx) {
-            if (deaf[i]) return;
-            if (ps[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now)) return;
-            if (st[i]) st[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now);
-        };
-    // 1 MB from 0 to 1, with a recognisable pattern.
-    const size_t total = 1 << 20;
-    size_t sent = 0;
-    std::vector<uint8_t> got;
-    bool corrupt = false;
-    int pollNow = 0;
-    auto tick = [&](TimePoint now) {
-        TimePoint next = TimePoint::max();
-        for (int i = 0; i < 2; ++i) {
-            if (deaf[i]) continue;
-            next = std::min(next, ps[i]->poll(now));
-            if (!st[i] && ps[i]->state() == PunchState::Established) {
-                StreamConfig sc;
-                sc.socket = ps[i]->establishedSocket();
-                sc.remote = ps[i]->remoteEndpoint();
-                sc.token = tok;
-                st[i] = std::make_unique<Stream>(sc, test::kcpFactory(), w[i], now);
-            }
-        }
-        if (st[0] && !deaf[0]) {
-            uint8_t chunk[4096];
-            while (sent < total && st[0]->writable()) {
-                size_t n = std::min(sizeof chunk, total - sent);
-                for (size_t k = 0; k < n; ++k) chunk[k] = uint8_t((sent + k) * 131);
-                size_t t = st[0]->write(chunk, n, now);
-                if (!t) break;
-                sent += t;
-            }
-        }
-        if (st[1] && !deaf[1]) {
-            uint8_t buf[8192];
-            while (size_t n = st[1]->read(buf, sizeof buf)) {
-                for (size_t k = 0; k < n; ++k) corrupt |= buf[k] != uint8_t((got.size() + k) * 131);
-                got.insert(got.end(), buf, buf + n);
-            }
-        }
-        for (int i = 0; i < 2; ++i)
-            if (st[i] && !deaf[i]) {
-                const TimePoint at = st[i]->poll(now);
-                if (at <= now) ++pollNow;   // a caller trusting it would spin
-                next = std::min(next, at);
-            }
-        return std::max(next, now + Duration(1));
-    };
-    TimePoint t0 = w.loop.now;
-    w.run(tick, t0 + Duration(120000));
-    CHECK(ps[0]->state() == PunchState::Established && ps[1]->state() == PunchState::Established);
-    CHECK(st[0] && st[1]);
-    if (!st[0] || !st[1]) return;
-    CHECK_EQ(got.size(), total);
-    CHECK(!corrupt);
-    CHECK_EQ(pollNow, 0);
-    std::printf("  1 MB with 5%% loss: %llu datagrams out, %llu in\n",
-                (unsigned long long)st[0]->stats().datagramsOut, (unsigned long long)st[0]->stats().datagramsIn);
-    // Idle for 10 minutes (CGNAT binding timeouts 30 s / 120 s): the
-    // keepalives keep the path open both ways.
-    lossy = false;
-    w.run(tick, w.loop.now + Duration(600000));
-    CHECK(st[0]->state() == StreamState::Open && st[1]->state() == StreamState::Open);
-    CHECK(st[0]->stats().keepalivesOut >= 25);
-    const uint8_t late[3] = {7, 8, 9};
-    st[1]->write(late, 3, w.loop.now);
-    size_t before = st[0]->readable();
-    w.run(tick, w.loop.now + Duration(2000));
-    CHECK_EQ(st[0]->readable(), before + 3);
-    // One large write (more than KCP takes in one ikcp_send): accepted up to
-    // the window, delivered whole.
-    std::vector<uint8_t> blob(300000, 0x42);
-    const size_t took = st[1]->write(blob.data(), blob.size(), w.loop.now);
-    CHECK(took >= 100000);
-    before = st[0]->readable();
-    w.run(tick, w.loop.now + Duration(10000));
-    CHECK_EQ(st[0]->readable(), before + took);
-    // Peer 1 disappears: peer 0 sees the stream dead within deadAfter keepalives.
-    deaf[1] = true;
-    TimePoint gone = w.loop.now;
-    w.run(tick, gone + Duration(90000));
-    CHECK(st[0]->state() == StreamState::Dead);
-    // A stranger with the token but another endpoint is ignored.
-    auto bogus = proto::encodeStream(tok, 0, pl, 5);
-    CHECK(!st[0]->onDatagram(prim[0], Endpoint{0x01010101, 1}, bogus.data(), bogus.size(), w.loop.now));
-}
-
-// Obfuscated session: the application's transform on every datagram of the
-// punch and of the stream. On the wire no natd header; mismatched keys, or
-// one side only obfuscating, never establish.
+// Obfuscated punch: the application's transform on every datagram of the
+// punch. On the wire no natd header; mismatched keys, or one side only
+// obfuscating, never establish.
 namespace {
 struct TestObfuscator : IDatagramObfuscator {
     uint8_t key;
@@ -1893,9 +1701,9 @@ struct TestObfuscator : IDatagramObfuscator {
     }
 };
 
-struct ObfResult { bool established = false; size_t bytes = 0; uint64_t plainOnWire = 0, onWire = 0; };
+struct ObfResult { bool established = false; uint64_t plainOnWire = 0, onWire = 0; };
 
-ObfResult runObfuscated(int keyA, int keyB, size_t total) {   // key < 0: no obfuscation on that side
+ObfResult runObfuscated(int keyA, int keyB) {   // key < 0: no obfuscation on that side
     NatProfile stable;
     stable.predictability = Predictability::Stable;
     stable.keepaliveInterval = Duration(20000);
@@ -1923,7 +1731,6 @@ ObfResult runObfuscated(int keyA, int keyB, size_t total) {   // key < 0: no obf
     for (int i = 0; i < 2; ++i)
         if (keys[i] >= 0) obf[i] = std::make_shared<TestObfuscator>(uint8_t(keys[i]));
     std::unique_ptr<PunchSession> ps[2];
-    std::unique_ptr<Stream> st[2];
     for (int i = 0; i < 2; ++i) {
         PunchSessionConfig c;
         c.plan = planDirect(stable, seen[1 - i]);
@@ -1935,157 +1742,17 @@ ObfResult runObfuscated(int keyA, int keyB, size_t total) {   // key < 0: no obf
         ps[i] = std::make_unique<PunchSession>(c, w[i]);
     }
     for (int i = 0; i < 2; ++i)
-        w[i].onRx = [&, i](const Host::Rx& rx) {
-            if (ps[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now)) return;
-            if (st[i]) st[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now);
-        };
-    size_t sent = 0;
+        w[i].onRx = [&, i](const Host::Rx& rx) { ps[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now); };
     auto tick = [&](TimePoint now) {
         TimePoint next = TimePoint::max();
-        for (int i = 0; i < 2; ++i) {
-            next = std::min(next, ps[i]->poll(now));
-            if (!st[i] && ps[i]->state() == PunchState::Established) {
-                StreamConfig sc;
-                sc.socket = ps[i]->establishedSocket();
-                sc.remote = ps[i]->remoteEndpoint();
-                sc.token = tok;
-                sc.obfuscator = obf[i];
-                st[i] = std::make_unique<Stream>(sc, test::kcpFactory(), w[i], now);
-            }
-        }
-        if (st[0]) {
-            uint8_t chunk[4096];
-            while (sent < total && st[0]->writable()) {
-                const size_t n = std::min(sizeof chunk, total - sent);
-                for (size_t k = 0; k < n; ++k) chunk[k] = uint8_t((sent + k) * 131);
-                const size_t t = st[0]->write(chunk, n, now);
-                if (!t) break;
-                sent += t;
-            }
-        }
-        if (st[1]) {
-            uint8_t buf[8192];
-            while (size_t n = st[1]->read(buf, sizeof buf)) r.bytes += n;
-        }
-        for (int i = 0; i < 2; ++i)
-            if (st[i]) next = std::min(next, st[i]->poll(now));
+        for (int i = 0; i < 2; ++i) next = std::min(next, ps[i]->poll(now));
         return std::max(next, now + Duration(1));
     };
-    w.run(tick, w.loop.now + Duration(60000));
+    w.run(tick, w.loop.now + Duration(20000));
     r.established = ps[0]->state() == PunchState::Established && ps[1]->state() == PunchState::Established;
     return r;
 }
 } // namespace
-
-// The transport contract (IStreamTransport): natd carries the transport's
-// payloads and runs the session around them, whatever the transport is.
-static void testStreamTransport() {
-    std::puts("stream transport");
-    struct SinkIo : IDatagramIo {
-        std::vector<std::vector<uint8_t>> sent;
-        std::optional<SocketId> openSocket(uint16_t) override { return SocketId(1); }
-        void closeSocket(SocketId) override {}
-        Endpoint localEndpoint(SocketId) const override { return {0x0A000002, 4662}; }
-        bool send(SocketId, const Endpoint&, const uint8_t* d, size_t l) override { sent.emplace_back(d, d + l); return true; }
-    };
-    // A scripted transport: what it sends, whether it is flushed or failed.
-    struct Scripted : IStreamTransport {
-        StreamTransportInfo info;
-        std::vector<uint8_t> in;
-        bool isFlushed = true, isFailed = false;
-        explicit Scripted(const StreamTransportInfo& i) : info(i) {}
-        void input(const uint8_t* d, size_t l, TimePoint) override { in.insert(in.end(), d, d + l); }
-        size_t write(const uint8_t* d, size_t l, TimePoint) override { info.output(d, l); return l; }
-        bool writable() const override { return true; }
-        size_t readable() const override { return in.size(); }
-        size_t read(uint8_t* o, size_t m) override {
-            const size_t n = std::min(m, in.size());
-            std::copy_n(in.begin(), n, o);
-            in.erase(in.begin(), in.begin() + long(n));
-            return n;
-        }
-        TimePoint poll(TimePoint now) override { return now + Duration(1000); }
-        bool flushed() const override { return isFlushed; }
-        bool failed() const override { return isFailed; }
-    };
-    Scripted* last = nullptr;
-    StreamTransportFactory scripted = [&](const StreamTransportInfo& i) -> std::unique_ptr<IStreamTransport> {
-        auto t = std::make_unique<Scripted>(i);
-        last = t.get();
-        return t;
-    };
-    const TimePoint t0 = TimePoint{} + std::chrono::hours(1);
-    StreamConfig sc;
-    sc.socket = 1;
-    sc.remote = {0x5B000001, 5000};
-    for (int i = 0; i < 12; ++i) sc.token[size_t(i)] = uint8_t(i + 1);
-    sc.maxPayload = 100;
-
-    // No transport: the stream is dead at once, the Agent refuses sessions.
-    {
-        SinkIo io;
-        Stream none(sc, StreamTransportFactory{}, io, t0);
-        CHECK_EQ(none.state(), StreamState::Dead);
-        CHECK_EQ(none.write(reinterpret_cast<const uint8_t*>("x"), 1, t0), size_t(0));
-        AgentConfig ac;
-        Agent agent(ac, io, StreamTransportFactory{});
-        CHECK_EQ(agent.connect(Endpoint{0x5B000001, 5000}, sc.token, t0), SessionId(0));
-        CHECK_EQ(agent.accept(Endpoint{0x5B000001, 5000}, sc.token, t0), SessionId(0));
-    }
-    // Payloads go out in STREAM messages with the token, the same bytes;
-    // more than maxPayload is not sent; the info the factory got.
-    {
-        SinkIo io;
-        Stream st(sc, scripted, io, t0);
-        CHECK(last && last->info.token == sc.token && last->info.maxPayload == 100);
-        const uint8_t p[5] = {9, 8, 7, 6, 5};
-        CHECK_EQ(st.write(p, 5, t0), size_t(5));
-        CHECK_EQ(io.sent.size(), size_t(1));
-        if (!io.sent.empty()) {
-            auto m = proto::decodeStream(io.sent[0].data(), io.sent[0].size());
-            CHECK(m && m->token == sc.token && m->flags == 0 && m->len == 5 && std::equal(p, p + 5, m->payload));
-        }
-        std::vector<uint8_t> big(101, 1);
-        last->info.output(big.data(), big.size());
-        CHECK_EQ(io.sent.size(), size_t(1));
-        // Input reaches the transport; read() returns it.
-        auto in = proto::encodeStream(sc.token, 0, p, 5);
-        CHECK(st.onDatagram(1, sc.remote, in.data(), in.size(), t0));
-        uint8_t back[8];
-        CHECK_EQ(st.read(back, sizeof back), size_t(5));
-        // FIN only once the transport is flushed.
-        last->isFlushed = false;
-        st.close(t0);
-        st.poll(t0 + Duration(10));
-        CHECK_EQ(st.state(), StreamState::Closing);
-        last->isFlushed = true;
-        st.poll(t0 + Duration(20));
-        CHECK_EQ(st.state(), StreamState::Closed);
-        auto fin = proto::decodeStream(io.sent.back().data(), io.sent.back().size());
-        CHECK(fin && (fin->flags & proto::kStreamFlagFin) && fin->len == 0);
-    }
-    // A transport that gives up: the stream is dead.
-    {
-        SinkIo io;
-        Stream st(sc, scripted, io, t0);
-        last->isFailed = true;
-        st.poll(t0 + Duration(10));
-        CHECK_EQ(st.state(), StreamState::Dead);
-    }
-    // Keepalives come from natd while the transport is quiet.
-    {
-        SinkIo io;
-        sc.keepalive = Duration(20000);
-        Stream st(sc, scripted, io, t0);
-        TimePoint t = t0;
-        for (int i = 0; i < 200; ++i) {
-            auto in = proto::encodeStream(sc.token, proto::kStreamFlagKeepalive, nullptr, 0);
-            st.onDatagram(1, sc.remote, in.data(), in.size(), t);   // the peer is alive
-            t = std::min(st.poll(t), t + Duration(1000));
-        }
-        CHECK(st.state() == StreamState::Open && st.stats().keepalivesOut >= 8);
-    }
-}
 
 // Dispatch costs: a punch looks at the source before it unwraps anything;
 // the Agent tells when it wants poll() also after other calls.
@@ -2119,50 +1786,30 @@ static void testDispatch() {
     ps.onDatagram(0, Endpoint{0x5B000001, 5000}, junk, sizeof junk, t0);
     CHECK_EQ(obf->unwraps, 1);
 
-    // A stream checks socket and endpoint before it unwraps, too.
-    {
-        auto obf3 = std::make_shared<Counting>();
-        StreamConfig sc;
-        sc.socket = 0;
-        sc.remote = {0x5B000001, 5000};
-        sc.token = pc.token;
-        sc.obfuscator = obf3;
-        Stream st(sc, test::kcpFactory(), io, t0);
-        for (int i = 0; i < 100; ++i) st.onDatagram(0, Endpoint{0x5B000001, uint16_t(6000 + i)}, junk, sizeof junk, t0);
-        st.onDatagram(1, sc.remote, junk, sizeof junk, t0);   // right endpoint, other socket
-        CHECK_EQ(obf3->unwraps, 0);
-        st.onDatagram(0, sc.remote, junk, sizeof junk, t0);
-        CHECK_EQ(obf3->unwraps, 1);
-    }
-
     // nextPoll(): what poll() said, or earlier after another call.
     AgentConfig ac;
     ac.discovery.primarySocket = 0;
     ac.discovery.stunServers = {{{0xC6336401, 3478}, 0}, {{0xC6336402, 3478}, 0}};
-    Agent agent(ac, io, test::kcpFactory());
+    Agent agent(ac, io);
     CHECK(agent.nextPoll() == TimePoint::max());
     agent.start(t0);
     CHECK(agent.nextPoll() <= t0);
     const TimePoint w = agent.poll(t0);
     CHECK(agent.nextPoll() == w && w > t0);
-    agent.checkEndpoint(t0 + Duration(10), false);
+    agent.checkEndpoint(t0 + Duration(10));
     CHECK(agent.nextPoll() <= t0 + Duration(10));
 }
 
 static void testObfuscation() {
-    std::puts("obfuscated punch and stream (application transform)");
-    const size_t total = 1024 * 1024;   // more than the window: write() fills up
-    const ObfResult same = runObfuscated(7, 7, total);
+    std::puts("obfuscated punch (application transform)");
+    const ObfResult same = runObfuscated(7, 7);
     CHECK(same.established);
-    CHECK_EQ(same.bytes, total);
     CHECK(same.onWire > 0 && same.plainOnWire == 0);   // no natd header on the path
-    const ObfResult plain = runObfuscated(-1, -1, total);
-    CHECK(plain.established && plain.bytes == total && plain.plainOnWire == plain.onWire);
-    const ObfResult wrongKey = runObfuscated(7, 8, total);
-    CHECK(!wrongKey.established && wrongKey.bytes == 0);
-    const ObfResult oneSide = runObfuscated(7, -1, total);
-    CHECK(!oneSide.established && oneSide.bytes == 0);
-    std::printf("  256 KB obfuscated: %llu datagrams, none with the natd header; plain: all %llu with it\n",
+    const ObfResult plain = runObfuscated(-1, -1);
+    CHECK(plain.established && plain.plainOnWire == plain.onWire);
+    CHECK(!runObfuscated(7, 8).established);
+    CHECK(!runObfuscated(7, -1).established);
+    std::printf("  obfuscated: %llu datagrams, none with the natd header; plain: all %llu with it\n",
                 (unsigned long long)same.onWire, (unsigned long long)plain.onWire);
 }
 
@@ -2178,7 +1825,8 @@ struct AgentRig {
     SocketId prim[2];
     std::unique_ptr<Agent> a[2];
     std::vector<AgentEvent> ev[2];
-    std::vector<TransportSet> made[2];   // what each factory was asked for
+    std::vector<std::vector<uint8_t>> appRx[2];   // datagrams natd said are not its own
+    uint64_t out[2] = {0, 0};                      // datagrams sent to anything but the STUN servers
     bool deaf[2] = {false, false};
 
     AgentRig(NatModel m0, NatModel m1, uint32_t seed, std::function<void(AgentConfig&, int)> tweak = {}) : w(m0, m1, seed) {
@@ -2195,6 +1843,7 @@ struct AgentRig {
                         }
                         return;
                     }
+                ++out[i];
                 old(src, to, std::move(d), fa);
             };
             AgentConfig c;
@@ -2202,12 +1851,10 @@ struct AgentRig {
             c.discovery.measureLifetime = false;
             for (auto& sv : stun) c.discovery.stunServers.push_back({sv.ep, sv.altPort});
             if (tweak) tweak(c, i);
-            a[i] = std::make_unique<Agent>(c, w[i], [this, i, f = test::kcpFactory()](const StreamTransportInfo& info) {
-                made[i].push_back(info.transport);
-                return f(info);
-            });
+            a[i] = std::make_unique<Agent>(c, w[i]);
             w[i].onRx = [this, i](const Host::Rx& rx) {
-                if (!deaf[i]) a[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now);
+                if (!deaf[i] && !a[i]->onDatagram(rx.sock, rx.from, rx.data.data(), rx.data.size(), w.loop.now))
+                    appRx[i].push_back(rx.data);
             };
         }
     }
@@ -2225,7 +1872,7 @@ struct AgentRig {
             return std::max(next, now + Duration(1));
         }, w.loop.now + d);
     }
-    bool saw(int i, AgentEventType t, SessionId id = 0, SessionError* err = nullptr) const {
+    bool saw(int i, AgentEventType t, SessionId id = 0, PunchError* err = nullptr) const {
         for (auto& e : ev[i])
             if (e.type == t && (id == 0 || e.session == id)) { if (err) *err = e.error; return true; }
         return false;
@@ -2291,14 +1938,15 @@ static void testAgent() {
         const int whilePunching = flood(500);
         CHECK_EQ(whilePunching, 0);
         r.run(Duration(10000));
-        CHECK(r.saw(0, AgentEventType::Connected, c) && r.saw(1, AgentEventType::Incoming, in));
+        CHECK(r.saw(0, AgentEventType::Punched, c) && r.saw(1, AgentEventType::Punched, in));
         CHECK(o0->unwraps > 0);                                            // its own datagrams were unwrapped
-        const int whileOpen = flood(500);
-        CHECK_EQ(whileOpen, 0);
-        std::printf("  obfuscated session: 500 foreign datagrams while punching, 500 while open: %d and %d unwrap() calls\n",
-                    whilePunching, whileOpen);
+        CHECK(r.a[0]->takeResult(c, r.w.loop.now) && r.a[1]->takeResult(in, r.w.loop.now));
+        const int whileHandedOver = flood(500);                            // the punch still answers late PUNCHes
+        CHECK_EQ(whileHandedOver, 0);
+        std::printf("  obfuscated punch: 500 foreign datagrams while punching, 500 after the hand-over: %d and %d unwrap() calls\n",
+                    whilePunching, whileHandedOver);
     }
-    // Discovery, punch, stream, graceful close.
+    // Discovery, punch, hand-over: the path is the application's.
     {
         AgentRig r(cg, cg, 5);
         uint8_t junk[3] = {0xE3, 1, 2};   // the application's own protocol
@@ -2314,107 +1962,73 @@ static void testAgent() {
         SessionId s1 = r.a[1]->accept(r.a[0]->publicEndpoint(), tok, r.w.loop.now);
         CHECK(s0 != 0 && s1 != 0);
         CHECK_EQ(r.a[1]->accept(r.a[0]->publicEndpoint(), tok, r.w.loop.now), SessionId(0));   // repeated
-        const size_t total = 1024 * 1024;   // more than the window: write() fills up
-        size_t sent = 0;
-        std::vector<uint8_t> got;
-        bool corrupt = false;
-        int writables = 0;
-        size_t seen0 = 0, seen1 = 0;
-        auto app = [&](TimePoint now) {
-            for (; seen0 < r.ev[0].size(); ++seen0)
-                if (r.ev[0][seen0].type == AgentEventType::Writable) ++writables;
-            bool readable = false;
-            for (; seen1 < r.ev[1].size(); ++seen1)
-                readable |= r.ev[1][seen1].type == AgentEventType::Readable;
-            if (r.saw(0, AgentEventType::Connected, s0)) {
-                uint8_t chunk[4096];
-                while (sent < total) {
-                    size_t n = std::min(sizeof chunk, total - sent);
-                    for (size_t k = 0; k < n; ++k) chunk[k] = uint8_t((sent + k) * 131);
-                    size_t t = r.a[0]->write(s0, chunk, n, now);
-                    if (!t) break;
-                    sent += t;
-                }
-            }
-            if (readable) {
-                uint8_t buf[8192];
-                while (size_t n = r.a[1]->read(s1, buf, sizeof buf)) {
-                    for (size_t k = 0; k < n; ++k) corrupt |= buf[k] != uint8_t((got.size() + k) * 131);
-                    got.insert(got.end(), buf, buf + n);
-                }
-            }
-        };
-        r.run(Duration(60000), app);
-        CHECK(r.saw(0, AgentEventType::Connected, s0) && r.saw(1, AgentEventType::Incoming, s1));
-        CHECK(!r.saw(0, AgentEventType::Incoming) && !r.saw(1, AgentEventType::Connected));
-        CHECK_EQ(r.a[0]->phase(s0), SessionPhase::Open);
-        CHECK_EQ(got.size(), total);
-        CHECK(!corrupt);
-        CHECK(writables > 0);
-        // Side 1 is done: side 0 reads the end, then releases; both are freed.
-        r.a[1]->release(s1, r.w.loop.now);
-        CHECK_EQ(r.a[1]->write(s1, junk, 3, r.w.loop.now), size_t(0));
-        r.run(Duration(15000), app);
-        SessionError err = SessionError::Reset;
-        CHECK(r.saw(0, AgentEventType::Closed, s0, &err) && err == SessionError::None);
-        CHECK(!r.saw(1, AgentEventType::Closed, s1));   // released: no more events
-        r.a[0]->release(s0, r.w.loop.now);
-        r.run(Duration(15000));
-        CHECK_EQ(r.a[0]->sessionCount(), size_t(0));
-        CHECK_EQ(r.a[1]->sessionCount(), size_t(0));
-        CHECK_EQ(r.a[0]->phase(s0), SessionPhase::None);
-        // A peer that vanishes: the stream ends Reset, and our endpoint is checked.
-        const TxId tok2 = tokenFrom(key, 16, 43);
-        SessionId t0 = r.a[0]->connect(r.a[1]->publicEndpoint(), tok2, r.w.loop.now);
-        SessionId t1 = r.a[1]->accept(r.a[0]->publicEndpoint(), tok2, r.w.loop.now);
+        CHECK_EQ(r.a[0]->phase(s0), SessionPhase::Punching);
         r.run(Duration(20000));
-        CHECK(r.saw(0, AgentEventType::Connected, t0) && r.saw(1, AgentEventType::Incoming, t1));
-        r.deaf[1] = true;
-        r.run(Duration(90000));
-        err = SessionError::None;
-        CHECK(r.saw(0, AgentEventType::Closed, t0, &err) && err == SessionError::Reset);
-        CHECK_EQ(r.a[0]->phase(t0), SessionPhase::Over);
-        CHECK(!r.saw(0, AgentEventType::EndpointChanged));   // checked, and found the same
-        r.run(Duration(10000));   // the check starts when the stream is declared dead, near the end above
-        CHECK(r.saw(0, AgentEventType::EndpointChecked));
-        CHECK_EQ(r.a[0]->lastCheckResult(), QuickCheckResult::Valid);
-        CHECK(!r.a[0]->checking());
-        CHECK_EQ(r.a[0]->stats().streamsDead, 1u);
-        CHECK_EQ(r.a[0]->stats().endpointChecks, 1u);
-        CHECK_EQ(r.a[0]->stats().punchesEstablished, 2u);
-        r.a[0]->release(t0, r.w.loop.now);
+        CHECK(r.saw(0, AgentEventType::Punched, s0) && r.saw(1, AgentEventType::Punched, s1));
+        CHECK_EQ(r.a[0]->phase(s0), SessionPhase::Punched);
+        CHECK_EQ(r.a[0]->sessionCount(), size_t(1));
+        const std::optional<PunchResult> r0 = r.a[0]->takeResult(s0, r.w.loop.now);
+        const std::optional<PunchResult> r1 = r.a[1]->takeResult(s1, r.w.loop.now);
+        CHECK(r0 && r1);
+        if (r0 && r1) {
+            CHECK_EQ(r0->socket, r.prim[0]);
+            CHECK(r0->remote == r.a[1]->publicEndpoint() && r1->remote == r.a[0]->publicEndpoint());
+            CHECK(r0->local == r.w[0].localEndpoint(r.prim[0]));
+            CHECK(r0->keepalive >= Duration(15000));
+            CHECK(r0->mappingLifetime == mappingLifetime(r.a[0]->profile()) && r0->mappingLifetime);
+            CHECK(r0->strategy == PunchStrategy::Direct && !r0->incoming && r1->incoming);
+            CHECK(r0->token == tok && r1->token == tok);
+        }
+        CHECK(!r.a[0]->takeResult(s0, r.w.loop.now));            // once
+        CHECK_EQ(r.a[0]->phase(s0), SessionPhase::None);
         CHECK_EQ(r.a[0]->sessionCount(), size_t(0));
+        CHECK_EQ(r.a[1]->accept(r.a[0]->publicEndpoint(), tok, r.w.loop.now), SessionId(0));   // the request again, late
+        // The application's own datagrams over the path, both ways.
+        if (r0 && r1) {
+            const uint8_t hello[5] = {0xA9, 'h', 'e', 'l', 'o'};
+            r.w[0].send(r0->socket, r0->remote, hello, sizeof hello);
+            r.w[1].send(r1->socket, r1->remote, hello, sizeof hello);
+            r.run(Duration(1000));
+            CHECK(!r.appRx[0].empty() && !r.appRx[1].empty() && r.appRx[1].back().size() == sizeof hello);
+            // A late PUNCH of the peer (our last ACK lost) is answered while the
+            // punch budget lasts, and no longer after it.
+            const std::vector<uint8_t> late = proto::encode(proto::Punch{tok, false});
+            uint64_t before = r.out[0];
+            r.w[1].send(r1->socket, r1->remote, late.data(), late.size());
+            r.run(Duration(1000));
+            CHECK_EQ(r.out[0], before + 1);
+            r.run(Duration(25000));
+            before = r.out[0];
+            r.w[1].send(r1->socket, r1->remote, late.data(), late.size());
+            r.run(Duration(1000));
+            CHECK_EQ(r.out[0], before);
+        }
+        CHECK_EQ(r.a[0]->stats().punchesEstablished, 1u);
     }
     // Our NAT loses its mappings (a new address, a renumbered block): the
-    // application asks a check, the endpoint changed, the streams end.
+    // application asks a check, the endpoint changed.
     {
         AgentRig r(cg, cg, 8);
         for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
         r.run(Duration(30000));
         const Endpoint before = r.a[0]->publicEndpoint();
-        SessionId s0 = r.a[0]->connect(r.a[1]->publicEndpoint(), tok, r.w.loop.now);
-        SessionId s1 = r.a[1]->accept(before, tok, r.w.loop.now);
-        r.run(Duration(20000));
-        CHECK(r.saw(0, AgentEventType::Connected, s0) && r.saw(1, AgentEventType::Incoming, s1));
         r.w[0].box.flush();
         CHECK_EQ(r.a[0]->lastCheckResult(), QuickCheckResult::Pending);   // none yet
-        r.a[0]->checkEndpoint(r.w.loop.now, true);
+        r.a[0]->checkEndpoint(r.w.loop.now);
         CHECK(r.a[0]->checking());
-        r.a[0]->checkEndpoint(r.w.loop.now, true);   // one check at a time
+        r.a[0]->checkEndpoint(r.w.loop.now);   // one check at a time
         r.run(Duration(10000));
         CHECK(r.saw(0, AgentEventType::EndpointChecked));
         CHECK_EQ(r.a[0]->lastCheckResult(), QuickCheckResult::Changed);
         CHECK(r.saw(0, AgentEventType::EndpointChanged));
         CHECK(r.a[0]->publicEndpoint() != before);
-        SessionError err = SessionError::None;
-        CHECK(r.saw(0, AgentEventType::Closed, s0, &err) && err == SessionError::AddressChanged);
         CHECK_EQ(r.a[0]->stats().endpointChecks, 1u);
-        CHECK_EQ(r.a[0]->stats().streamsAddressChanged, 1u);
-        r.a[0]->checkEndpoint(r.w.loop.now, true);   // within checkReuse: the result stands
+        r.a[0]->checkEndpoint(r.w.loop.now);   // within checkReuse: the result stands
         CHECK_EQ(r.a[0]->stats().endpointChecksReused, 1u);
+        CHECK(!r.a[0]->checking());
     }
     // Caps: one punch at a time, one waiting; the waiting one gives up after
-    // punchWait, the next is refused at once.
+    // punchWait, the next is refused at once. A cancelled punch ends quietly.
     {
         AgentRig r(cg, cg, 6, [](AgentConfig& c, int) { c.maxPunches = 1; c.maxWaiting = 1; c.punchWait = Duration(5000); });
         for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
@@ -2427,15 +2041,21 @@ static void testAgent() {
         CHECK_EQ(r.a[0]->phase(q), SessionPhase::Waiting);
         CHECK_EQ(r.a[0]->connect(nobody, tokenFrom(key, 16, 3), r.w.loop.now), SessionId(0));
         r.run(Duration(30000));
-        SessionError e1 = SessionError::None, e2 = SessionError::None;
-        CHECK(r.saw(0, AgentEventType::Closed, p, &e1) && e1 == SessionError::TimedOut);
-        CHECK(r.saw(0, AgentEventType::Closed, q, &e2) && e2 == SessionError::TimedOut);
+        PunchError e1 = PunchError::None, e2 = PunchError::None;
+        CHECK(r.saw(0, AgentEventType::PunchFailed, p, &e1) && e1 == PunchError::TimedOut);
+        CHECK(r.saw(0, AgentEventType::PunchFailed, q, &e2) && e2 == PunchError::TimedOut);
         CHECK_EQ(r.a[0]->stats().punchesStarted, 1u);   // q never got a session
         CHECK_EQ(r.a[0]->stats().punchesQueued, 1u);
         CHECK_EQ(r.a[0]->stats().punchesFailed, 1u);
         CHECK_EQ(r.a[0]->stats().punchesRefused, 2u);   // the third at once, q after waiting
-        r.a[0]->release(p, r.w.loop.now);
-        r.a[0]->release(q, r.w.loop.now);
+        CHECK_EQ(r.a[0]->sessionCount(), size_t(0));
+        CHECK_EQ(r.a[0]->phase(p), SessionPhase::None);
+        SessionId c = r.a[0]->connect(nobody, tokenFrom(key, 16, 4), r.w.loop.now);
+        CHECK_EQ(r.a[0]->phase(c), SessionPhase::Punching);
+        r.a[0]->cancel(c, r.w.loop.now);
+        CHECK_EQ(r.a[0]->phase(c), SessionPhase::None);
+        r.run(Duration(30000));
+        CHECK(!r.saw(0, AgentEventType::PunchFailed, c));
         CHECK_EQ(r.a[0]->sessionCount(), size_t(0));
     }
     // A NAT with address+port dependent mapping: no direct punch.
@@ -2448,51 +2068,6 @@ static void testAgent() {
         CHECK(!r.a[0]->directPunchable());
         CHECK(r.a[1]->directPunchable());
         CHECK_EQ(r.a[0]->connect(r.a[1]->publicEndpoint(), tok, r.w.loop.now), SessionId(0));
-    }
-    // The stream transport: each PUNCH carries the sender's set, both peers
-    // take the highest bit in common, and with none the session is refused
-    // at the first packet instead of failing at the end of the budget.
-    {
-        CHECK_EQ(int(chooseTransport(0x03, 0x02)), 0x02);
-        CHECK_EQ(int(chooseTransport(0x03, 0x07)), 0x02);
-        CHECK_EQ(int(chooseTransport(0x01, 0x02)), 0);
-        CHECK_EQ(int(chooseTransport(0x03, 0)), 0x01);   // undeclared: natd before 0.1.4
-        CHECK_EQ(int(chooseTransport(0x02, 0)), 0);
-        proto::Punch p{tok, true, 0x05};
-        auto b = proto::encode(p);
-        CHECK_EQ(b.size(), proto::kPunchSize);
-        CHECK_EQ(int(b[7]), 0x05);
-        auto d = proto::decodePunch(b.data(), b.size());
-        CHECK(d && d->ack && d->transports == 0x05 && d->token == tok);
-        b[7] = 0;   // as natd 0.1.3 sent it
-        d = proto::decodePunch(b.data(), b.size());
-        CHECK(d && d->transports == 0);
-    }
-    struct Case { TransportSet t0, t1, agreed; };
-    for (const Case k : {Case{0x01, 0x01, 0x01}, Case{0x03, 0x02, 0x02}, Case{0x03, 0x03, 0x02}, Case{0x01, 0x02, 0}}) {
-        AgentRig r(cg, cg, 9, [k](AgentConfig& c, int i) { c.transports = i ? k.t1 : k.t0; });
-        for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
-        r.run(Duration(30000));
-        CHECK(r.a[0]->profileReady() && r.a[1]->profileReady());
-        const TimePoint t0 = r.w.loop.now;
-        const SessionId c = r.a[0]->connect(r.a[1]->publicEndpoint(), tok, t0);
-        const SessionId in = r.a[1]->accept(r.a[0]->publicEndpoint(), tok, t0);
-        CHECK(c != 0 && in != 0);
-        r.run(Duration(5000));   // well inside the 15 s a direct punch lasts
-        if (k.agreed) {
-            CHECK(r.saw(0, AgentEventType::Connected, c) && r.saw(1, AgentEventType::Incoming, in));
-            CHECK(r.made[0] == std::vector<TransportSet>{k.agreed} && r.made[1] == std::vector<TransportSet>{k.agreed});
-        } else {
-            CHECK(r.saw(0, AgentEventType::Closed, c) && r.saw(1, AgentEventType::Closed, in));
-            bool refused = true;
-            for (int i = 0; i < 2; ++i)
-                for (auto& e : r.ev[i])
-                    if (e.type == AgentEventType::Closed) refused = refused && e.error == SessionError::Refused;
-            CHECK(refused);
-            CHECK(r.made[0].empty() && r.made[1].empty());
-            CHECK_EQ(r.a[0]->stats().punchesRefused, 1u);
-            CHECK_EQ(r.a[0]->stats().punchesFailed, 0u);
-        }
     }
 }
 
@@ -2522,9 +2097,7 @@ int main() {
     testQuickCheck();
     testPeerInfo();
     testPunch();
-    testStream();
     testObfuscation();
-    testStreamTransport();
     testDispatch();
     testAgent();
     std::printf("%d checks, %d failed\n", g_checks, g_fail);

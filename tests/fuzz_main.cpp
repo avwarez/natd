@@ -14,22 +14,21 @@
 //              token, ACKs, other IPs, garbage, an obfuscated variant); it
 //              sends only to the remote IP, at most maxPackets punches, and
 //              no more ACKs than datagrams received from the remote IP
-//   stream     a script of STREAM datagrams with the right token and hostile
-//              KCP payloads (random, or real segments mutated), with writes,
-//              reads and close; poll() never keeps answering "now"
 //   discovery  a NAT discovery (and a QuickCheck) whose requests are answered
 //              with hostile responses (right transaction id, any content),
 //              garbage and strangers; it never holds more sockets than its
 //              cap and closes all of them when destroyed
 //   agent      an Agent (STUN-only discovery, then sessions) driven by a
-//              script of application calls (connect, accept, write, read,
-//              release, endpoint checks) and of datagrams (punches, ACKs and
-//              STREAM messages with right or wrong tokens, STUN answers that
-//              move the endpoint, garbage); events name only sessions the
-//              application holds, each Closed comes once and nothing after
-//              it, the caps hold, it sends only to STUN servers and to the
-//              peers it was given, poll() does not keep answering "now", and
-//              every session and socket is gone at the end
+//              script of application calls (connect, accept, takeResult,
+//              cancel, endpoint checks) and of datagrams (punches and ACKs
+//              with right or wrong tokens, the application's own traffic,
+//              STUN answers that move the endpoint, garbage); events name
+//              only sessions the application holds, each session ends once
+//              (Punched or PunchFailed) and nothing comes after, a result
+//              goes once and to its own session, the caps hold, it sends
+//              only to STUN servers and to the peers it was given, poll()
+//              does not keep answering "now", and every session and socket
+//              is gone at the end
 //
 // No coverage guidance (the Pi has no compiler-rt for libFuzzer): each input
 // is random bytes interpreted as a script, so that most steps build
@@ -43,7 +42,6 @@
 #include "natd/natd.hpp"
 #include "natd/protocol.hpp"
 #include "natd/stun.hpp"
-#include "kcp_transport.hpp"
 
 #include <csignal>
 #include <cstdio>
@@ -216,14 +214,6 @@ void fuzzDecoders(const uint8_t* d, size_t n) {
         auto m2 = decodePunch(e.data(), e.size());
         REQUIRE(m2 && m2->token == m->token && m2->ack == m->ack);
     }
-    if (auto m = decodeStream(d, n)) {
-        REQUIRE(m->len <= kMaxStreamPayload);
-        REQUIRE(m->len == 0 || (m->payload >= d && m->payload + m->len <= d + n));
-        auto e = encodeStream(m->token, m->flags, m->payload, m->len);
-        auto m2 = decodeStream(e.data(), e.size());
-        REQUIRE(m2 && m2->token == m->token && m2->flags == m->flags && m2->len == m->len &&
-                std::equal(m->payload, m->payload + m->len, m2->payload));
-    }
     if (auto r = stun::decodeBindingResponse(d, n)) (void)r->mapped.valid();
     if (auto pi = decodePeerInfo(d, n)) {
         REQUIRE(pi->localEndpoints.size() <= kMaxLocalEndpoints);
@@ -375,7 +365,7 @@ void fuzzPunch(const uint8_t* d, size_t n) {
             dg = proto::encode(p);
             break;
         }
-        case 2: dg = proto::encodeStream(c.token, s.u8(), nullptr, 0); break;
+        case 2: dg = s.bytes(40); break;   // the application's own traffic
         case 3: dg = s.bytes(300); break;
         case 4: now += Duration(s.u16()); break;
         }
@@ -407,75 +397,6 @@ void fuzzPunch(const uint8_t* d, size_t n) {
     if (acks > fromRemote) fail("more ACKs than datagrams from the remote IP");
 }
 
-// --------------------------------------------------------------------------
-void fuzzStream(const uint8_t* d, size_t n) {
-    Script s{d, n};
-    FakeIo io, peerIo;
-    const Endpoint remote{0x5B000001, 5000};
-    TimePoint now = TimePoint{} + std::chrono::hours(1);
-    StreamConfig sc;
-    sc.socket = 1;
-    sc.remote = remote;
-    sc.token = txIdFrom(s);
-    sc.keepalive = Duration(1000 + s.u16() % 20000);
-    sc.maxPayload = 200 + s.u16() % 1200;
-    const auto kcp = test::kcpFactory(1 + s.u8());
-    Stream st(sc, kcp, io, now);
-    // A well-behaved peer whose segments are mutated on their way in.
-    StreamConfig pc = sc;
-    pc.remote = {0x5A000001, 4672};
-    Stream peer(pc, kcp, peerIo, now);
-    std::vector<uint8_t> buf(70000);
-    int nowStreak = 0;
-    while (!s.done()) {
-        const uint8_t op = s.u8();
-        std::vector<uint8_t> dg;
-        switch (op % 8) {
-        case 0: case 1: {   // a real segment from the peer, maybe mutated
-            const size_t w = s.u16() % 5000;
-            std::vector<uint8_t> data(w, uint8_t(op));
-            peer.write(data.data(), data.size(), now);
-            peer.poll(now);
-            if (peerIo.sent.empty()) break;
-            dg = peerIo.sent[s.u8() % peerIo.sent.size()].data;
-            if (peerIo.sent.size() > 64) peerIo.sent.erase(peerIo.sent.begin(), peerIo.sent.begin() + 32);
-            break;
-        }
-        case 2: {   // a STREAM message with a hostile KCP payload
-            auto pl = s.bytes(proto::kMaxStreamPayload);
-            dg = proto::encodeStream(sc.token, s.u8() & 0x03, pl.data(), pl.size());
-            break;
-        }
-        case 3: dg = s.bytes(1500); break;
-        case 4: {
-            const size_t w = s.u16();
-            std::vector<uint8_t> data(w, 0x33);
-            st.write(data.data(), data.size(), now);
-            break;
-        }
-        case 5: {
-            const size_t got = st.read(buf.data(), s.u16() % buf.size());
-            REQUIRE(got <= buf.size());
-            break;
-        }
-        case 6: if (s.u8() < 16) st.close(now); break;
-        case 7: now += Duration(s.u16()); break;
-        }
-        if (op & 0x80) mutate(dg, s);
-        if (!dg.empty()) {
-            Endpoint from = op & 0x40 ? Endpoint{s.u32(), s.u16()} : remote;
-            st.onDatagram(s.u8() & 7 ? 1 : 2, from, dg.data(), dg.size(), now);
-        }
-        // The answers of our stream reach the peer, so that its window moves.
-        for (auto& m : io.sent) peer.onDatagram(1, remote, m.data.data(), m.data.size(), now);
-        io.sent.clear();
-        const TimePoint next = st.poll(now);
-        nowStreak = next <= now ? nowStreak + 1 : 0;
-        if (nowStreak > 3) fail("Stream::poll keeps answering now (a caller would spin)");
-        now = std::max(now, std::min(next, now + Duration(s.u8() * 10)));
-        REQUIRE(st.readable() <= size_t(1) << 26);
-    }
-}
 
 // --------------------------------------------------------------------------
 template <class Engine>
@@ -563,7 +484,7 @@ void fuzzDiscovery(const uint8_t* d, size_t n) {
 
 // What the agent target reached, printed after its run (an input that never
 // gets a profile tests little).
-struct { uint64_t inputs = 0, ready = 0, sessions = 0, open = 0, closed = 0; } g_agentReach;
+struct { uint64_t inputs = 0, ready = 0, sessions = 0, open = 0, closed = 0; } g_agentReach;   // open: punched, closed: failed
 
 void fuzzAgent(const uint8_t* d, size_t n) {
     ++g_agentReach.inputs;
@@ -583,20 +504,18 @@ void fuzzAgent(const uint8_t* d, size_t n) {
     cfg.randomBytes = rnd;
     cfg.maxPunches = 1 + s.u8() % 4;
     cfg.maxWaiting = s.u8() % 4;
-    cfg.maxSessions = 1 + s.u8() % 8;
     cfg.punchWait = Duration(100 + s.u16() % 20000);
-    cfg.linger = Duration(s.u16() % 20000);
     cfg.checkReuse = Duration(s.u16() % 120000);
     std::set<uint32_t> allowed;   // where it may send
     for (auto& sv : stunServers) allowed.insert(sv.ep.ip);
     Endpoint publicEp{0x5A000001, uint16_t(1024 + s.u16() % 60000)};
     TimePoint now = TimePoint{} + std::chrono::hours(1);
-    struct Held { bool incoming; Endpoint remote; TxId token; bool closed = false; bool open = false; };
-    std::map<SessionId, Held> held;   // the application's sessions (not released)
-    std::set<SessionId> released;
+    struct Held { bool incoming; Endpoint remote; TxId token; bool closed = false; bool open = false; bool taken = false; };
+    std::map<SessionId, Held> held;   // the application's sessions (not cancelled)
+    std::set<SessionId> released;   // cancelled
     std::vector<Endpoint> peers = {{0x5B000001, 4672}, {0x5B000002, 4672}, {0x5C000003, 50000}};
     {
-        Agent agent(cfg, io, test::kcpFactory());
+        Agent agent(cfg, io);
         agent.start(now);
         size_t answered = 0;   // io.sent entries already looked at
         // honest STUN answers, from the mapping the script chooses
@@ -619,17 +538,14 @@ void fuzzAgent(const uint8_t* d, size_t n) {
                     REQUIRE(e.session == 0);
                     continue;
                 }
-                if (released.count(e.session)) fail("event for a released session");
+                if (released.count(e.session)) fail("event for a cancelled session");
                 auto it = held.find(e.session);
                 if (it == held.end()) fail("event for a session the application never got");
                 Held& h = it->second;
-                if (h.closed) fail("event after Closed");
+                if (h.closed || h.open) fail("event after Punched or PunchFailed");
                 switch (e.type) {
-                case AgentEventType::Connected: REQUIRE(!h.incoming && !h.open); h.open = true; ++g_agentReach.open; break;
-                case AgentEventType::Incoming:  REQUIRE(h.incoming && !h.open); h.open = true; ++g_agentReach.open; break;
-                case AgentEventType::Readable:
-                case AgentEventType::Writable:  REQUIRE(h.open); break;
-                case AgentEventType::Closed:    h.closed = true; ++g_agentReach.closed; break;
+                case AgentEventType::Punched:     h.open = true; ++g_agentReach.open; break;
+                case AgentEventType::PunchFailed: h.closed = true; ++g_agentReach.closed; break;
                 default: break;
                 }
             }
@@ -641,7 +557,6 @@ void fuzzAgent(const uint8_t* d, size_t n) {
             if (next <= now) { if (++spins > 50) fail("poll() keeps answering now"); }
             else spins = 0;
             now = std::max(now, std::min(next, now + Duration(s.u8() * 20)));
-            if (agent.sessionCount() > cfg.maxSessions) fail("more sessions than maxSessions");
             size_t punching = 0;
             for (auto& [id, h] : held) punching += agent.phase(id) == SessionPhase::Punching;
             if (punching > cfg.maxPunches) fail("more punch sessions than maxPunches");
@@ -687,36 +602,38 @@ void fuzzAgent(const uint8_t* d, size_t n) {
                 agent.onDatagram(s.u8() & 7 ? 1 : SocketId(2 + s.u8() % 4), from, dg.data(), dg.size(), now);
                 break;
             }
-            case 4: {   // a STREAM message with hostile payload
+            case 4: {   // the application's own traffic over a path, from its peer
                 SessionId id = pick();
                 auto it = held.find(id);
-                const TxId tok = it != held.end() && (s.u8() & 3) ? it->second.token : txIdFrom(s);
                 auto pl = s.bytes(1400);
-                auto dg = proto::encodeStream(tok, s.u8() & 0x03, pl.data(), pl.size());
-                Endpoint from = it != held.end() ? agent.remote(id) : Endpoint{s.u32(), s.u16()};
-                if (!from.valid()) from = Endpoint{s.u32(), s.u16()};
-                agent.onDatagram(1, from, dg.data(), dg.size(), now);
+                Endpoint from = it != held.end() ? it->second.remote : Endpoint{s.u32(), s.u16()};
+                agent.onDatagram(1, from, pl.data(), pl.size(), now);
                 break;
             }
-            case 5: {   // the application writes
-                auto b = s.bytes(4000);
-                agent.write(pick(), b.data(), b.size(), now);
-                break;
-            }
-            case 6: {   // reads
-                uint8_t buf[2048];
-                agent.read(pick(), buf, s.u8() % 2 ? sizeof buf : size_t(s.u8()));
-                break;
-            }
-            case 7: {   // releases
+            case 5: case 6: {   // takes a result
                 const SessionId id = pick();
-                if (held.count(id)) { held.erase(id); released.insert(id); }
-                agent.release(id, now);
+                auto it = held.find(id);
+                const bool punched = agent.phase(id) == SessionPhase::Punched;
+                const std::optional<PunchResult> r = agent.takeResult(id, now);
+                if (bool(r) != punched) fail("takeResult() and phase() disagree");
+                if (r) {
+                    if (it == held.end() || !it->second.open || it->second.taken) fail("a result for a session not punched");
+                    if (r->token != it->second.token || r->incoming != it->second.incoming) fail("the result of another session");
+                    it->second.taken = true;
+                    if (agent.takeResult(id, now)) fail("a result taken twice");
+                }
+                break;
+            }
+            case 7: {   // cancels
+                const SessionId id = pick();
+                auto it = held.find(id);
+                if (it != held.end() && !it->second.taken) { held.erase(it); released.insert(id); }
+                agent.cancel(id, now);
                 break;
             }
             case 8:   // the endpoint may have changed
                 if (s.u8() < 64) publicEp.port = uint16_t(1024 + s.u16() % 60000);
-                agent.checkEndpoint(now, s.u8() & 1);
+                agent.checkEndpoint(now);
                 break;
             case 9: answerStun(false); break;
             case 10: {   // garbage
@@ -731,11 +648,11 @@ void fuzzAgent(const uint8_t* d, size_t n) {
         }
         for (auto& m : io.sent)
             if (!allowed.count(m.to.ip)) fail("sent to an address that is neither a STUN server nor a peer");
-        // the application lets everything go: after the linger nothing is left
-        for (auto& [id, h] : held) agent.release(id, now);
+        // the application lets everything go: nothing is left, also of what it took
+        for (auto& [id, h] : held) agent.cancel(id, now);
         held.clear();
         for (int k = 0; k < 200; ++k) { now += Duration(500); agent.poll(now); drain(); }
-        if (agent.sessionCount() != 0) fail("sessions left after release and linger");
+        if (agent.sessionCount() != 0) fail("sessions left after cancel");
     }
     if (io.open.size() != 1) fail("the agent left sockets open after it was destroyed");
 }
@@ -746,7 +663,6 @@ const Target kTargets[] = {
     {"decoders", fuzzDecoders, 600, 200000},
     {"reflector", fuzzReflector, 3000, 5000},
     {"punch", fuzzPunch, 3000, 5000},
-    {"stream", fuzzStream, 4000, 3000},
     {"discovery", fuzzDiscovery, 4000, 2000},
     {"agent", fuzzAgent, 4000, 2000},
 };
@@ -760,8 +676,6 @@ std::vector<std::vector<uint8_t>> decoderSeeds() {
     v.push_back(proto::encode(proto::ProbeResp{t, {0x01020304, 5000}, proto::ReplyKind::Partner, 0x87}));
     v.push_back(proto::encode(proto::ForwardReq{t, {0x01020304, 5000}}));
     v.push_back(proto::encode(proto::Punch{t, true}));
-    const uint8_t pl[5] = {1, 2, 3, 4, 5};
-    v.push_back(proto::encodeStream(t, 0, pl, sizeof pl));
     v.push_back(stun::encodeBindingRequest(t));
     std::vector<uint8_t> none;
     Script empty{nullptr, 0};

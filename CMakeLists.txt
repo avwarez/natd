@@ -25,7 +25,6 @@ add_library(natd STATIC
     src/discovery.cpp
     src/punch.cpp
     src/stun.cpp
-    src/stream.cpp
     src/agent.cpp
     src/version.cpp
     src/sha256.cpp
@@ -54,17 +53,11 @@ if(NATD_EXAMPLES)
 endif()
 
 option(NATD_TESTS "Build tests" ON)
-# KCP (tests/kcp, MIT) is the stream transport of the tests only: the library
-# carries the application's transport (IStreamTransport) and knows none.
-if(NATD_TESTS OR NATD_FUZZ)
-    add_library(natd_test_kcp STATIC tests/kcp/ikcp.c)
-    target_include_directories(natd_test_kcp PUBLIC tests/kcp)
-endif()
 
 if(NATD_TESTS)
     enable_testing()
     add_executable(natd_tests tests/test_main.cpp)
-    target_link_libraries(natd_tests PRIVATE natd natd_test_kcp)
+    target_link_libraries(natd_tests PRIVATE natd)
     add_test(NAME natd_tests COMMAND natd_tests)
     add_executable(natd_io_tests tests/test_io.cpp)
     target_link_libraries(natd_io_tests PRIVATE natd)
@@ -77,7 +70,7 @@ endif()
 option(NATD_FUZZ "Build the fuzz driver" OFF)
 if(NATD_FUZZ)
     add_executable(natd_fuzz tests/fuzz_main.cpp)
-    target_link_libraries(natd_fuzz PRIVATE natd natd_test_kcp)
+    target_link_libraries(natd_fuzz PRIVATE natd)
     target_compile_definitions(natd PRIVATE _GLIBCXX_ASSERTIONS)
     target_compile_definitions(natd_fuzz PRIVATE _GLIBCXX_ASSERTIONS)
 endif()

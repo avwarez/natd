@@ -14,7 +14,6 @@
 #pragma once
 
 #include "natd/discovery.hpp"
-#include "natd/stream.hpp"
 
 #include <memory>
 #include <vector>
@@ -125,8 +124,9 @@ PunchPlan planDirect(const NatProfile& local, const Endpoint& remote, const Punc
 // sessions apart and keeps out packets from anyone who did not see the data:
 // with a random nonce in it that only the signalling channel carries, an
 // off-path sender has to guess 96 bits (a TCP connection: 32). It is no
-// authentication: whoever sees the signalling can derive it, so the stream
-// is as safe as an unencrypted TCP connection, no more.
+// authentication: whoever sees the signalling can derive it, so what an
+// application runs over the path with it is as safe as an unencrypted TCP
+// connection, no more.
 TxId sessionTokenFrom(const uint8_t* data, size_t len);
 
 // ---------------------------------------------------------------------------
@@ -140,11 +140,8 @@ struct PunchSessionConfig {
     TimePoint startAt{};           // agreed start time (local clock)
     uint32_t  remoteIp = 0;        // packets from other IPs are ignored
     SocketId  primarySocket = 0;
-    // The stream transports we run, in every PUNCH (see stream.hpp). A peer
-    // with none of them in common fails the session at its first packet.
-    TransportSet transports = kFirstTransport;
     // Optional: transform of every datagram of the session (null: plain natd
-    // format). Give the Stream that follows the same one.
+    // format).
     std::shared_ptr<IDatagramObfuscator> obfuscator;
 };
 
@@ -160,10 +157,6 @@ public:
     SocketId   establishedSocket() const;   // valid when Established
     Endpoint   remoteEndpoint() const;      // valid when Established
     Duration   keepalive() const;
-    // The stream transport both peers run (chooseTransport), when Established.
-    TransportSet transport() const;
-    // Failed because the peer runs none of our transports.
-    bool       noCommonTransport() const;
 
 private:
     struct Impl;

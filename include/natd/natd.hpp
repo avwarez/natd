@@ -10,5 +10,4 @@
 #include "natd/reflector.hpp"
 #include "natd/punch.hpp"
 #include "natd/stun.hpp"
-#include "natd/stream.hpp"
 #include "natd/agent.hpp"

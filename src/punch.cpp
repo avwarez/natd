@@ -540,8 +540,6 @@ struct PunchSession::Impl {
     size_t cursor = 0;                // position inside the current round
     int punchesSent = 0;              // PUNCH (non-ACK) packets, capped by plan.maxPackets
     std::set<std::pair<SocketId, uint64_t>> heard;   // (socket, endpoint) that sent us a punch
-    TransportSet transport = 0;       // agreed with the peer, from its first packet
-    bool noTransport = false;
 
     Impl(PunchSessionConfig c, IDatagramIo& i) : cfg(std::move(c)), io(i) {
         for (auto& t : cfg.plan.targets)
@@ -566,7 +564,7 @@ struct PunchSession::Impl {
     static uint64_t key(const Endpoint& e) { return (uint64_t(e.ip) << 16) | e.port; }
 
     void sendPunch(SocketId s, const Endpoint& to, bool ack) {
-        proto::Punch p{cfg.token, ack, cfg.transports};
+        proto::Punch p{cfg.token, ack};
         auto b = proto::encode(p);
         if (cfg.obfuscator) b = cfg.obfuscator->wrap(b.data(), b.size());
         io.send(s, to, b.data(), b.size());
@@ -649,15 +647,6 @@ struct PunchSession::Impl {
             return true;
         }
         if (st != PunchState::Punching) return true;
-        // Every packet of the peer says what it runs: with nothing in common no
-        // stream could work, so the session ends now rather than at the budget.
-        transport = chooseTransport(cfg.transports, p->transports);
-        if (!transport) {
-            st = PunchState::Failed;
-            noTransport = true;
-            closeExtras();
-            return true;
-        }
         if (!p->ack) {
             // Inbound works on this socket; answer and keep punching there.
             sendPunch(s, from, true);
@@ -689,7 +678,5 @@ PunchState PunchSession::state() const { return impl_->st; }
 SocketId PunchSession::establishedSocket() const { return impl_->estSock; }
 Endpoint PunchSession::remoteEndpoint() const { return impl_->estEp; }
 Duration PunchSession::keepalive() const { return impl_->cfg.plan.keepalive; }
-TransportSet PunchSession::transport() const { return impl_->transport; }
-bool PunchSession::noCommonTransport() const { return impl_->noTransport; }
 
 } // namespace natd

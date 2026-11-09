@@ -4,7 +4,9 @@ A sans-I/O C++17 library for NAT behaviour discovery (IPv4/UDP) and UDP hole
 punching. It owns no sockets, threads or timers: the application feeds it
 datagrams and the current time, and sends what it asks to send.
 
-natd is application-agnostic. It covers:
+natd is application-agnostic and has no dependencies. It ends where the hole
+is open: what goes over the punched path, how it is kept open and when it
+ends are the application's. It covers:
 
 - **discovery** of the NAT in front of a socket: mapping and filtering
   behaviour (RFC 4787, RFC 5780), port allocation pattern, hairpinning and
@@ -12,13 +14,12 @@ natd is application-agnostic. It covers:
 - **punch planning and sessions** between two peers, from what each one
   learned about its own NAT (`PeerInfo`), exchanged over any signalling
   channel the application already has;
-- **a stream session** (`Stream`) over the punched path: the session token,
-  keepalives, dead-path detection and the graceful close, around a
-  transport the application supplies (`IStreamTransport`; natd knows no
-  transport protocol);
 - **one object for applications** (`Agent`) that puts these together: the
   life of the profile, endpoint checks, caps and a queue for punch sessions,
-  the move from punch to stream, a lingering close, and a queue of events;
+  and a queue of events. A punch that gets through hands the application
+  everything it needs to use the path (`PunchResult`: the socket, both
+  endpoints, how often to send to keep the hole open, how long our mapping
+  lives);
 - small **socket adapters** for POSIX and Winsock 2, for applications that do
   not bring their own I/O.
 
@@ -36,8 +37,6 @@ natd is application-agnostic. It covers:
 | `src/punch.cpp` | `PeerInfo`, `predictNextPorts`, `planPunch`, `planDirect`, `sessionTokenFrom`, `PunchSession` |
 | `include/natd/version.hpp`, `src/version.cpp` | library version and wire format versions |
 | `include/natd/agent.hpp`, `src/agent.cpp` | `Agent`: the integration point for applications; `encodeOffer`, `decodeOffer`, `tokenFrom` |
-| `include/natd/stream.hpp`, `src/stream.cpp` | `Stream` and `IStreamTransport`: the session over the punched path (token, keepalives, dead-path detection, FIN) around the application's transport |
-| `tests/kcp/`, `tests/kcp_transport.hpp` | KCP 1.7 (MIT licence), unmodified, and its adapter: the transport of the tests and the fuzz driver only |
 | `sim/natsim.hpp` | simulation building blocks (NAT, STUN server, virtual clock), reusable by application simulators |
 | `include/natd/stun.hpp`, `src/stun.cpp` | minimal STUN Binding client (RFC 8489), server list parser, built-in fallback list |
 | `include/natd/posix_io.hpp`, `src/posix_io.cpp` | `IDatagramIo` adapter on POSIX sockets |
@@ -82,17 +81,16 @@ target.
 
 ### Fuzzing
 
-`tests/fuzz_main.cpp` has six targets: decoders and parsers, the reflector,
-the punch session, the stream (with the KCP test transport) under hostile segments, discovery and
-QuickCheck with hostile answers, and the `Agent` driven by a script of
+`tests/fuzz_main.cpp` has five targets: decoders and parsers, the reflector,
+the punch session, discovery and QuickCheck with hostile answers, and the `Agent` driven by a script of
 application calls and hostile datagrams. Besides crashes it checks properties: decode
 and re-encode agree; the reflector never sends an IP more bytes than it
 received from it, and only to sources, partners or targets a partner named;
 the punch session sends only to the remote IP, at most `maxPackets`, and never
-more ACKs than datagrams received; `Stream::poll()` does not keep answering
-"now"; discovery stays within its mapping cap and closes every socket; the
-`Agent` gives events only for sessions the application holds, one `Closed`
-per session and nothing after it, keeps its caps, sends only to STUN servers
+more ACKs than datagrams received; discovery stays within its mapping cap and closes every socket; the
+`Agent` gives events only for sessions the application holds, one end per
+session (`Punched` or `PunchFailed`) and nothing after it, hands a result
+over once and to its own session, keeps its caps, sends only to STUN servers
 and to the peers it was given, and leaves no session or socket behind. There
 is no coverage guidance (libFuzzer needs compiler-rt): each input is a random
 script that builds mostly well-formed messages with hostile fields.
@@ -158,7 +156,6 @@ An application creates one `Agent` on the UDP socket it already has (its
 goes to `onDatagram()` before the application parses it, `poll()` is called
 when it asks (`nextPoll()` says when, also after a datagram or another call
 that moved a timer earlier), and events are read with `nextEvent()`. A
-datagram reaches its stream in one lookup (by socket and endpoint), and a
 punch looks at the source before it decodes or unwraps anything. The split
 of responsibilities:
 
@@ -168,47 +165,26 @@ of responsibilities:
 | "this datagram is mine" on the shared socket | the socket, and which protocol reads first |
 | the offer format (`encodeOffer`: "NATD", version, kind, nonce) | where the offer travels: its own signalling channel |
 | the session token from the bytes it is given (`tokenFrom`) | which bytes: something both peers know |
-| punch, stream, keepalives, linger, caps on sessions | whether and with whom to punch, and the values of the caps |
-| `EndpointChanged`; streams whose path is gone end as `Reset` | what makes it check (`checkEndpoint`) and what to do after (publish again, ...) |
-| the obfuscation interface | the transform and its keys |
+| the punch, caps and a queue for punch sessions | whether and with whom to punch, and the values of the caps |
+| `PunchResult`: socket, endpoints, keepalive interval, mapping lifetime | everything over the path: its format, transport, keepalives, liveness, close |
+| `EndpointChanged` | what makes it check (`checkEndpoint`: a lost connection, a path that went silent) and what to do after (close its paths, publish again, ...) |
+| the obfuscation interface for the punch | the transform and its keys |
 | no thread, no lock, no callback | threads and the lock around every call |
-| the stream session: token, keepalives, liveness, FIN | the transport inside it (`IStreamTransport`): reliability, order, flow and congestion control |
-| bytes over the stream | the protocol over them |
-
-The transport contract (`natd/stream.hpp`): `input()` gets each payload the
-peer's transport sent; `write()`, `read()`, `readable()` and `writable()`
-are the stream's; `poll()` drives its timers; `flushed()` says that
-everything written was acknowledged (natd sends the FIN only then);
-`failed()` says it gave up (the stream is `Reset`). It sends through
-`info.output`, at most `info.maxPayload` bytes at a time, synchronously
-from inside these calls. Both peers must run the same transport. An
-application that may run more than one numbers them as bits of a
-`TransportSet` (`AgentConfig::transports`, for instance 0x01 for its first
-transport and 0x02 for a later one): every PUNCH carries the sender's set,
-both peers take the highest bit they have in common (`chooseTransport`) and
-the factory gets it in `info.transport`. That works on every signalling
-channel, also one with no room for it, and needs no message of its own; with
-nothing in common the session ends `Refused` at the peer's first packet. A
-peer before natd 0.1.4 declares nothing and is taken to run bit 0. Adding a
-transport needs no new natd version.
 
 A session belongs to the application from `connect()` or `accept()` until
-`release()`. It ends with `Connected` or `Incoming`, and later with
-`Closed`, which comes after the bytes that arrived before the end were read.
-`Readable` and `Writable` are edge-triggered: one event, until the next
-`read()`, or until `write()` returned 0 again.
+it ends: with `PunchFailed` (`Refused`, `TimedOut`), or with `Punched`, after
+which `takeResult()` hands over the path once. From then on natd keeps only
+the punch, to answer the peer's PUNCH packets until the punch budget ends
+(its last ACK may have been lost); everything else on that socket from that
+endpoint is the application's. The application sends something on the path
+at least every `keepalive` while it is idle, decides itself when the path is
+dead (and then asks `checkEndpoint()`), and closes it its own way;
+`cancel()` gives up on a session that has not been handed over.
 
 ```cpp
 natd::AgentConfig cfg;
 cfg.discovery.primarySocket = mySocket;
-cfg.transports = 0x01;   // the transports the factory below makes (the default)
-// The application's transport, one per session (KCP in eMule, see
-// tests/kcp_transport.hpp for an example). natd calls it and carries what it
-// sends through info.output; it never reads the payloads.
-natd::StreamTransportFactory transport = [](const natd::StreamTransportInfo& info) {
-    return std::make_unique<MyTransport>(info);
-};
-natd::Agent agent(cfg, myIo, transport);
+natd::Agent agent(cfg, myIo);
 agent.start(now, resolvedStunServers);
 
 // peer A, after sending the offer over its own channel
@@ -220,7 +196,10 @@ if (auto o = natd::decodeOffer(data, len))
     agent.accept(from, natd::tokenFrom(key, 16, o->nonce), now);
 
 natd::AgentEvent e;
-while (agent.nextEvent(e)) { /* Connected, Incoming, Readable, Writable, Closed, ... */ }
+while (agent.nextEvent(e))
+    if (e.type == natd::AgentEventType::Punched)
+        if (auto r = agent.takeResult(e.session, now))
+            startMyPath(r->socket, r->remote, r->keepalive);   // the application's from here
 ```
 
 ### Public STUN servers
@@ -275,8 +254,8 @@ only in ways that serve that NAT.
 | Reflector probes | RFC 8085 §3.1.3: request/response with loss detection, initial interval >= 500 ms with exponential backoff | same schedule as STUN, `1 + probeRetries` requests |
 | Hairpin test | RFC 8085 §3.1.3 | 3 sends at 0, RTO, 3 RTO |
 | Punch | RFC 8085 §3.1.3: no return traffic yet = at most one datagram every 3 s | `punchInterval` >= 3 s (default 4 s), for `planDirect` and `planPunch` |
-| Keepalive | RFC 8085 §3.5: >= 15 s, with jitter | stream 20 s + up to 10% random; profile default 15 s |
-| Stream | RFC 8085 §3.1: congestion control | the application's transport (the KCP of the tests: normal mode, `nc = 0`) |
+| Keepalive | RFC 8085 §3.5: >= 15 s, with jitter | `PunchResult::keepalive`: the profile's (default 15 s); sending it, with jitter, is the application's |
+| Traffic over the path | RFC 8085 §3.1: congestion control | the application's |
 | Mapping, filtering, hairpin | RFC 4787 §4.1, §5, REQ-9; RFC 5780 §4.3-4.4 | classified as defined there |
 | Mapping lifetime | RFC 4787 REQ-5 (>= 2 min), REQ-6 (outbound refresh) | `mappingLifetime()`: the measurement, else 2 min for an endpoint-independent mapping, else none |
 | CGNAT | RFC 6888 REQ-4: port quota | `maxMappings` caps |
@@ -307,16 +286,16 @@ answers therefore ends after about 40 s (before: 2 s).
 natd aims at the security of an unencrypted TCP connection between two
 applications, no more.
 
-- **Stream integrity.** A stream accepts a datagram only on the punched
-  socket, from the punched remote endpoint, with the session token. The token
-  is SHA-256 of what the application gives `tokenFrom`/`sessionTokenFrom`,
+- **Session token.** A punch accepts a datagram only on its sockets, from
+  the remote IP, with the session token; the application should hold its
+  own traffic over the path to the same: only the punched socket and remote
+  endpoint, with something both sides derive from the token. The token is
+  SHA-256 of what the application gives `tokenFrom`/`sessionTokenFrom`,
   truncated to 96 bits: with a random nonce that only the signalling channel
   carries, an off-path sender has to guess 96 bits (TCP: a 32-bit sequence
   number). Whoever sees the signalling (the two peers, a relay, anyone on the
   path) can derive the token and inject or alter data, as on a plain TCP
-  connection. The protocol over the stream must not rely on more. A
-  datagram transform that authenticates could be supplied through
-  `IDatagramObfuscator`; natd does not ship one.
+  connection. The protocol over the path must not rely on more.
 - **Addresses declared by the peer.** `planPunch` sends to the endpoints in
   the peer's `PeerInfo` (its observed endpoint and, behind the same NAT, up
   to 4 inside addresses), up to `maxPackets` per session with the birthday
@@ -384,11 +363,10 @@ applications, no more.
   ACK, ACK. Targets outside `remoteIp` are dropped: the caller must take the
   IP from the signalling channel, not from what the peer declares.
 - **Obfuscation** (`IDatagramObfuscator`, optional in `PunchSessionConfig`
-  and `StreamConfig`): the application supplies a transformation of the
-  datagrams of one session (`wrap` outgoing, `unwrap` incoming; `unwrap`
+  and the `Agent`'s `connect()`/`accept()`): the application supplies a
+  transformation of the datagrams of one punch (`wrap` outgoing, `unwrap` incoming; `unwrap`
   returning false means the datagram is not for this session and is left to
-  other handlers). natd does no cryptography itself. The same object goes to
-  the punch session and to the stream that follows it. Without it the wire
+  other handlers). natd does no cryptography itself. Without it the wire
   format is unchanged. This is obfuscation, not secrecy: anyone who knows the
   data the application derives the keys from can read the traffic.
 - **Discovery without reflectors**: with STUN servers only, discovery gives a
@@ -590,16 +568,15 @@ the whole range.
 Tested:
 
 - the `Agent` in the simulator: discovery from STUN servers only, a direct
-  punch between two CGNATs, 1 MB over the stream with write back-pressure,
-  graceful close, a vanished peer (`Reset` and an endpoint check), a NAT
-  that loses its mappings (`EndpointChanged`, streams `AddressChanged`), the
-  punch caps and the waiting queue, and no direct punch behind an
-  address+port dependent mapping (Linux, UBSan and Wine ARM64);
-- the unit and simulation checks on Linux and under UBSan, including 1 MB
-  between two EIM + APDF CGNATs with 5% loss, 10 minutes of idle time kept
-  open by keepalives, a vanished peer detected, and obfuscated sessions
-  (no datagram with the `"NATD"` header on the wire; different keys, or
-  obfuscation on one side only, give no session);
+  punch between two CGNATs, the hand-over (`PunchResult`, the application's
+  datagrams over the path both ways, late PUNCHes answered while the punch
+  budget lasts and not after), a NAT that loses its mappings
+  (`EndpointChanged`), the punch caps, the waiting queue and `cancel()`, and
+  no direct punch behind an address+port dependent mapping (Linux and UBSan;
+  natd 0.1.x also on Wine ARM64);
+- the unit and simulation checks on Linux and under UBSan, including
+  obfuscated punches (no datagram with the `"NATD"` header on the wire; different keys, or
+  obfuscation on one side only, never establish);
 - the socket adapter checks on Linux and under Wine ARM64, and cross-platform
   loopback between Linux and Windows;
 - memory errors and leaks under Valgrind memcheck (AddressSanitizer does not
@@ -634,8 +611,6 @@ Not tested yet:
 6. Static analysis (clang-tidy, cppcheck, MSVC `/analyze`).
 7. A long run: hours of discovery, endpoint checks and sessions opening and
    closing, watching memory, sockets and counters.
-8. The cost of a stream (CPU per MB through `Stream` and a transport)
-   against TCP.
 
 Positive hairpinning is verified only in the simulator: Linux masquerade does
 not hairpin (netns: `hairpin=None`), and a hairpinning Linux NAT needs a DNAT
@@ -664,6 +639,4 @@ terms of the GNU General Public License as published by the Free Software
 Foundation, either version 2 of the License, or (at your option) any later
 version. See [COPYING](COPYING).
 
-The library has no third-party code. `tests/kcp/` (tests and fuzz driver
-only) is KCP by Lin Wei, under the MIT licence (`tests/kcp/LICENSE`), which
-is compatible with the GPL.
+The library, its tests and its tools have no third-party code.
