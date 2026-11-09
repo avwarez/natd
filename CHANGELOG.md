@@ -12,6 +12,22 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-09
+
+### API
+- `natd/resolve.hpp`, a platform adapter like the socket ones:
+  `resolveIpv4()`, `resolveStunServers()` (the built-in list by default: in
+  order, one address per host, no duplicates or names that do not resolve)
+  and `StunResolver`, which does it on a thread of its own so that the
+  caller never waits for DNS (`ready()`, `servers()`); destroying it never
+  waits either. The library links the platform's threads for it. The
+  example tools use it.
+
+### Documentation
+- natd takes datagrams only from the endpoints it addressed (the STUN
+  servers and reflectors it asked, the peer of a punch), so an application
+  may hand them over before its own address filters.
+
 ## [0.2.0] - 2026-11-09
 
 natd now ends where the hole is open: a punch that gets through hands the

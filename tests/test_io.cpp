@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 avwarez
 
-// Socket adapter tests (PlatformDatagramIo) on the loopback interface.
+// Platform adapter tests: PlatformDatagramIo on the loopback interface, and the
+// STUN name resolver (dotted addresses and localhost only: no DNS needed).
 // Same file on Linux (POSIX), Windows and Wine (Winsock). Exit 0 = passed.
 #include "natd/platform_io.hpp"
+#include "natd/resolve.hpp"
+
+#include <thread>
 
 #include <cstdio>
 #include <cstring>
@@ -93,6 +97,31 @@ int main() {
     auto el = std::chrono::duration_cast<Duration>(Clock::now() - t0).count();
     CHECK(n == 0);
     CHECK(el >= 100 && el < 1200);
+
+    // Name resolution: dotted and localhost, order kept, duplicates and
+    // names that do not resolve skipped, max honoured; the resolver thread
+    CHECK(resolveIpv4("1.2.3.4") == 0x01020304);
+    CHECK(resolveIpv4("localhost") == kLo);
+    CHECK(resolveIpv4("no-such-host.invalid") == 0);
+    const std::vector<stun::ServerEntry> list = {{"1.2.3.4", 3478, 3479}, {"no-such-host.invalid", 3478, 0},
+                                                 {"1.2.3.4", 3478, 0}, {"localhost", 19302, 0}, {"5.6.7.8", 3478, 0}};
+    const std::vector<StunEndpoint> r = resolveStunServers(list);
+    CHECK(r.size() == 3);
+    if (r.size() == 3) {
+        CHECK(r[0].ep == (Endpoint{0x01020304, 3478}) && r[0].altPort == 3479);
+        CHECK(r[1].ep == (Endpoint{kLo, 19302}) && r[2].ep == (Endpoint{0x05060708, 3478}));
+    }
+    CHECK(resolveStunServers(list, 2).size() == 2);
+    {
+        StunResolver res(list);
+        for (int i = 0; i < 500 && !res.ready(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(res.ready());
+        const std::vector<StunEndpoint> rs = res.servers();
+        CHECK(rs.size() == r.size() && (rs.empty() || rs[0].ep == r[0].ep));
+    }
+    {
+        StunResolver gone(list);   // destroyed at once: never waits for its thread
+    }
 
     std::printf("%d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

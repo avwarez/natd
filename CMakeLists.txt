@@ -28,7 +28,10 @@ add_library(natd STATIC
     src/agent.cpp
     src/version.cpp
     src/sha256.cpp
+    src/resolve.cpp
 )
+find_package(Threads REQUIRED)
+target_link_libraries(natd PUBLIC Threads::Threads)   # StunResolver
 if(WIN32)
     target_sources(natd PRIVATE src/winsock_io.cpp)
     target_link_libraries(natd PUBLIC ws2_32 bcrypt)

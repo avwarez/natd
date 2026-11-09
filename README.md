@@ -1,8 +1,8 @@
 # natd
 
 A sans-I/O C++17 library for NAT behaviour discovery (IPv4/UDP) and UDP hole
-punching. It owns no sockets, threads or timers: the application feeds it
-datagrams and the current time, and sends what it asks to send.
+punching. Its core owns no sockets, threads or timers: the application feeds
+it datagrams and the current time, and sends what it asks to send.
 
 natd is application-agnostic and has no dependencies. It ends where the hole
 is open: what goes over the punched path, how it is kept open and when it
@@ -20,8 +20,10 @@ ends are the application's. It covers:
   everything it needs to use the path (`PunchResult`: the socket, both
   endpoints, how often to send to keep the hole open, how long our mapping
   lives);
-- small **socket adapters** for POSIX and Winsock 2, for applications that do
-  not bring their own I/O.
+- small **platform adapters**, for applications that do not bring their own
+  I/O: sockets for POSIX and Winsock 2, and the resolution of the STUN server
+  names (`resolveStunServers`, or `StunResolver` on a thread of its own, since
+  DNS blocks).
 
 ## Contents
 
@@ -39,6 +41,7 @@ ends are the application's. It covers:
 | `include/natd/agent.hpp`, `src/agent.cpp` | `Agent`: the integration point for applications; `encodeOffer`, `decodeOffer`, `tokenFrom` |
 | `sim/natsim.hpp` | simulation building blocks (NAT, STUN server, virtual clock), reusable by application simulators |
 | `include/natd/stun.hpp`, `src/stun.cpp` | minimal STUN Binding client (RFC 8489), server list parser, built-in fallback list |
+| `include/natd/resolve.hpp`, `src/resolve.cpp` | platform adapter: STUN server names to endpoints (`resolveIpv4`, `resolveStunServers`, `StunResolver`) |
 | `include/natd/posix_io.hpp`, `src/posix_io.cpp` | `IDatagramIo` adapter on POSIX sockets |
 | `include/natd/winsock_io.hpp`, `src/winsock_io.cpp` | `IDatagramIo` adapter on Winsock 2 |
 | `include/natd/platform_io.hpp` | `PlatformDatagramIo`: the adapter of the current platform |
@@ -161,8 +164,9 @@ of responsibilities:
 
 | natd (`Agent`) | the application |
 |---|---|
-| discovery, profile, endpoint checks (one at a time, at most one per `checkReuse`) | when to start (`start()`), the STUN server names (DNS is the application's) |
-| "this datagram is mine" on the shared socket | the socket, and which protocol reads first |
+| discovery, profile, endpoint checks (one at a time, at most one per `checkReuse`) | when to start (`start()`) |
+| the STUN servers: built-in list, resolution (`StunResolver`, optional) | another list, if it has one |
+| "this datagram is mine" on the shared socket, taken only from the endpoints natd addressed (the STUN servers and reflectors it asked, the peer of a punch) | the socket, and which protocol reads first: natd's datagrams may come before the application's own address filters |
 | the offer format (`encodeOffer`: "NATD", version, kind, nonce) | where the offer travels: its own signalling channel |
 | the session token from the bytes it is given (`tokenFrom`) | which bytes: something both peers know |
 | the punch, caps and a queue for punch sessions | whether and with whom to punch, and the values of the caps |
