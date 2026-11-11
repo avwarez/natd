@@ -380,13 +380,16 @@ applications, no more.
   both peers share.
 - **Peers of unknown NAT**: when the channel carries only the endpoint it
   saw, `Agent::connect`/`accept` with `PeerNat::Unknown` (`planUnknownPeer`)
-  also reach a Bounded peer (a mobile CGN with random ports in a block): a
-  Stable side sends the first round to the endpoint alone, then sprays the
-  whole aligned block of `unknownBlock` ports around it every round; a
-  Bounded side punches the endpoint from `limits.maxSockets` sockets (one:
-  its primary socket only). The endpoint must be a recent mapping of the
-  Bounded side's punching socket, since a CGN that fills a block opens
-  another one. With a port block per subscriber the spray reaches only the
+  also reach a Predictable peer (sequential ports) and a Bounded one (a
+  mobile CGN with random ports in a block). A Stable side sends the first
+  round to the endpoint alone, then sprays every round the whole aligned
+  block of `unknownBlock` ports around it and the `unknownAhead` ports past
+  it; a Predictable or Bounded side punches the endpoint from its primary
+  socket only. The endpoint must be a fresh mapping of that socket, as the
+  one of a request it has just sent to the channel: the peer's next mapping
+  then follows it, or lies in its block. Two sides that both open a new port
+  (Predictable or Bounded on both sides) and an Unpredictable side are not
+  covered. With a port block per subscriber the spray reaches only the
   peer's own mappings; behind a NAT without blocks, other subscribers of the
   same address may get punch packets, which they drop.
 

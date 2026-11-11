@@ -2082,8 +2082,9 @@ static void testAgent() {
 // CGN) against a Stable one with port-dependent filtering, and two Stable ones.
 static void testUnknownPeer() {
     std::puts("unknown peer");
-    // Planning: a block that fits in a round is sprayed whole, every round,
-    // and a newer observed endpoint outside the measured block moves it.
+    // Planning: the endpoint first, then the aligned block around it and
+    // the ports just past it; a Predictable or Bounded side punches the
+    // endpoint from its primary socket.
     {
         PeerInfo s, b;
         s.observed = {0xCB007105, 4662}; b.observed = {0xC6120A07, 22200};
@@ -2092,43 +2093,44 @@ static void testUnknownPeer() {
         b.profile.predictability = Predictability::Bounded;
         b.profile.details.mapping = MappingBehavior::AddressPortDependent;
         b.profile.details.sameSocket = {AllocationPattern::RandomInBlock, 0, 0, {22144, 128}, 12, 0.9};
-        auto inBlock = [](const std::vector<Endpoint>& targets, uint32_t lo, uint32_t n) {
+        // the ports of [lo, hi), each once
+        auto covers = [](const std::vector<Endpoint>& targets, uint32_t lo, uint32_t hi) {
             std::set<uint16_t> ports;
             for (auto& t : targets) {
-                if (t.port < lo || t.port >= lo + n) return false;
+                if (t.port < lo || t.port >= hi) return false;
                 ports.insert(t.port);
             }
-            return ports.size() == n && targets.size() == n;
+            return ports.size() == hi - lo && targets.size() == hi - lo;
         };
-        auto ps = planPunch(s, b, PunchLimits{}), pb = planPunch(b, s, PunchLimits{});
-        CHECK_EQ(ps.strategy, PunchStrategy::BirthdaySpray);
-        CHECK_EQ(pb.strategy, PunchStrategy::BirthdayListen);
-        CHECK(ps.wholeRange && inBlock(ps.targets, 22144, 128));
-        CHECK(std::abs(ps.estimatedSuccess - pb.estimatedSuccess) < 1e-9);
-        CHECK(ps.estimatedSuccess > 0.9);
-        b.observed.port = 33600;                    // the CGN moved to another block
-        auto moved = planPunch(s, b, PunchLimits{});
-        CHECK(moved.wholeRange && inBlock(moved.targets, 33536, 128));
-        // a block larger than a round: slices, as before
-        b.profile.details.sameSocket.block = {20480, 2048};
-        b.observed.port = 21000;
-        auto big = planPunch(s, b, PunchLimits{});
-        CHECK(!big.wholeRange && big.strategy == PunchStrategy::BirthdaySpray);
-        // planUnknownPeer: the endpoint first, then the block around it
-        b.profile.details.sameSocket.block = {22144, 128};
+        // planPunch keeps its slices
+        CHECK(!planPunch(s, b, PunchLimits{}).wholeRange);
         const Endpoint seen{0xC6120A07, 22200};
         auto u = planUnknownPeer(s.profile, seen, PunchLimits{});
         CHECK(u.strategy == PunchStrategy::BirthdaySpray && u.wholeRange && u.sprayFromRound == 1);
-        CHECK(!u.targets.empty() && u.targets.front() == seen && inBlock(u.targets, 22144, 128));
-        auto ub = planUnknownPeer(b.profile, s.observed, PunchLimits{});
-        CHECK(ub.strategy == PunchStrategy::BirthdayListen && ub.targets.size() == 1 && ub.targets[0] == s.observed);
-        PunchLimits one; one.maxSockets = 1;
-        CHECK_EQ(planUnknownPeer(b.profile, s.observed, one).localSockets, 1);
+        CHECK(!u.targets.empty() && u.targets.front() == seen && covers(u.targets, 22144, 22272));
+        // near the end of the block: the ports past it too
+        const Endpoint top{0xC6120A07, 22260};
+        auto ut = planUnknownPeer(s.profile, top, PunchLimits{});
+        CHECK(ut.targets.front() == top && covers(ut.targets, 22144, 22260 + 1 + 64));
         PunchLimits wide; wide.unknownBlock = 256;
-        CHECK(inBlock(planUnknownPeer(s.profile, seen, wide).targets, 22016, 256));
-        NatProfile hard = b.profile;
-        hard.predictability = Predictability::Unpredictable;
-        CHECK_EQ(planUnknownPeer(hard, s.observed, PunchLimits{}).strategy, PunchStrategy::Infeasible);
+        CHECK(covers(planUnknownPeer(s.profile, seen, wide).targets, 22016, 22272));
+        PunchLimits noAhead; noAhead.unknownAhead = 0;
+        CHECK(covers(planUnknownPeer(s.profile, top, noAhead).targets, 22144, 22272));
+        // the last ports of the range: no wrap
+        auto end = planUnknownPeer(s.profile, Endpoint{0xC6120A07, 65530}, PunchLimits{});
+        CHECK(covers(end.targets, 65408, 65536));
+        for (Predictability hp : {Predictability::Bounded, Predictability::Predictable}) {
+            NatProfile h = b.profile;
+            h.predictability = hp;
+            auto ub = planUnknownPeer(h, s.observed, PunchLimits{});
+            CHECK(ub.strategy == PunchStrategy::BirthdayListen && ub.localSockets == 1);
+            CHECK(ub.targets.size() == 1 && ub.targets[0] == s.observed);
+        }
+        for (Predictability hp : {Predictability::Unpredictable, Predictability::Inconclusive, Predictability::UdpBlocked}) {
+            NatProfile h = b.profile;
+            h.predictability = hp;
+            CHECK_EQ(planUnknownPeer(h, s.observed, PunchLimits{}).strategy, PunchStrategy::Infeasible);
+        }
     }
     const uint8_t key[16] = {1, 2, 3};
     NatModel st; st.mapping = Map::EI; st.filtering = Filt::APD; st.alloc = Alloc::Preserve;
@@ -2153,7 +2155,7 @@ static void testUnknownPeer() {
     int ok = 0, runs = 0;
     double packets = 0;
     for (uint32_t seed = 11; seed < 31; ++seed) {
-        AgentRig r(st, cg, seed, [](AgentConfig& c, int) { c.limits.maxSockets = 1; });
+        AgentRig r(st, cg, seed);
         for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
         r.run(Duration(30000));
         CHECK(r.a[0]->directPunchable() && r.a[0]->punchable());
@@ -2180,13 +2182,52 @@ static void testUnknownPeer() {
             CHECK(r0->strategy == PunchStrategy::BirthdaySpray && r1->strategy == PunchStrategy::BirthdayListen);
             CHECK_EQ(r1->socket, r.prim[1]);
             CHECK(r0->remote.port >= 22144 && r0->remote.port < 22272 && r0->remote != seenB);
-            CHECK(r.out[0] - before <= 1 + 128 * 5 + 10);
+            CHECK(r.out[0] - before <= 1 + (128 + 64) * 5 + 10);
         }
     }
     std::printf("  Bounded (block 128) <-> Stable APDF, one socket: %d/%d punched, %.0f packets from the Stable side on average\n",
                 ok, runs, ok ? packets / ok : 0.0);
     CHECK_EQ(ok, runs);
-    // A side that is neither Stable nor Bounded cannot punch an unknown peer.
+    // Predictable: sequential ports. The channel saw a fresh mapping of the
+    // primary socket, as the one of the request the side has just sent to
+    // the server; its mapping towards the peer comes next.
+    struct Seq { int delta; double busy; const char* name; };
+    for (const Seq q : {Seq{1, 0, "delta 1"}, Seq{2, 0, "delta 2"}, Seq{1, 2, "delta 1, others 2/s"}}) {
+        NatModel sq; sq.mapping = Map::APD; sq.filtering = Filt::APD; sq.alloc = Alloc::Sequential;
+        sq.delta = q.delta; sq.othersPerSec = q.busy;
+        ok = 0; runs = 0; packets = 0;
+        for (uint32_t seed = 41; seed < 61; ++seed) {
+            AgentRig r(st, sq, seed);
+            for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
+            r.run(Duration(30000));
+            if (r.a[1]->profile().predictability != Predictability::Predictable) continue;
+            CHECK(!r.a[1]->directPunchable() && r.a[1]->punchable());
+            const Endpoint lp = r.w[1].localEndpoint(r.prim[1]);
+            const Endpoint server{0xC0000263, 4675};
+            const Endpoint seenP{r.w[1].box.nat.publicIp, r.w[1].box.outbound(lp.ip, lp.port, server, r.w.loop.now)};
+            const TxId tok = tokenFrom(key, 16, seed);
+            const SessionId s0 = r.a[0]->connect(seenP, PeerNat::Unknown, tok, r.w.loop.now);
+            const SessionId s1 = r.a[1]->accept(r.a[0]->publicEndpoint(), PeerNat::Unknown, tok, r.w.loop.now);
+            CHECK(s0 != 0 && s1 != 0);
+            const uint64_t before = r.out[0];
+            r.run(Duration(25000));
+            ++runs;
+            const auto r0 = r.a[0]->takeResult(s0, r.w.loop.now);
+            const auto r1 = r.a[1]->takeResult(s1, r.w.loop.now);
+            if (r0 && r1) {
+                ++ok;
+                packets += double(r.out[0] - before);
+                CHECK(r1->strategy == PunchStrategy::BirthdayListen && r1->socket == r.prim[1]);
+                CHECK(r0->remote.port > seenP.port && r0->remote.port <= seenP.port + 1 + 64);
+            }
+        }
+        std::printf("  Predictable (%s) <-> Stable APDF, one socket: %d/%d punched, %.0f packets from the Stable side on average\n",
+                    q.name, ok, runs, ok ? packets / ok : 0.0);
+        CHECK(runs >= 15);
+        CHECK_EQ(ok, runs);
+    }
+    // A side that is neither Stable, Predictable nor Bounded cannot punch an
+    // unknown peer.
     {
         NatModel full = cg; full.alloc = Alloc::RandomFull;
         AgentRig r(st, full, 5);

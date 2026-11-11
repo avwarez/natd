@@ -12,6 +12,24 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-11
+
+A Predictable side (sequential ports) can now be punched over a channel that
+carries only the endpoint it saw, as a Bounded one since 0.3.0.
+
+### API
+- `PunchLimits::unknownAhead` (64): with `planUnknownPeer`, a Stable side
+  also sprays the ports just past the endpoint, beyond the end of its block.
+- `Agent::punchable()`: Stable, Predictable or Bounded.
+
+### Behaviour
+- `planUnknownPeer`: a Predictable side punches as a Bounded one, the
+  endpoint from its primary socket; a Bounded one no longer opens
+  `maxSockets` sockets (the Stable side sprays the whole block, one mapping
+  is met as well, and more would use up the block).
+- `planPunch` is again as in 0.2.1: the block-following and the whole-range
+  spray of 0.3.0 go, as nothing used them.
+
 ## [0.3.0] - 2026-11-10
 
 A Bounded side (dependent mapping, random ports inside a block, as mobile

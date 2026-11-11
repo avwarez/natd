@@ -407,21 +407,10 @@ PunchPlan planPunch(const PeerInfo& local, const PeerInfo& remote, const PunchLi
     // The hard side keeps its K mappings alive across rounds while the spray
     // moves to new ports each round, so the M*R sprayed ports add up.
     const int rounds = roundsIn(plan);
-    // A range that fits in one round is sprayed whole every round: packets
-    // then add up over the rounds on the same ports.
-    auto wholeRange = [&](uint32_t n) { return n <= uint32_t(sprayTargets); };
-    auto bdayP = [&](const NatProfile& hard, const Endpoint& obs) {
+    auto bdayP = [&](const NatProfile& hard) {
         uint32_t lo, n;
         remoteRange(hard, lo, n);
-        // A CGN that fills a block opens another one elsewhere: the block
-        // measured by the discovery is old once the observed endpoint, newer,
-        // lies outside it. Blocks are aligned to their size (fitBlock).
-        if (n < kFullSize && obs.valid() && !(obs.port >= lo && uint32_t(obs.port) < lo + n)) {
-            lo = (uint32_t(obs.port) / n) * n;
-            n = std::min<uint32_t>(n, 65536 - lo);
-        }
-        int64_t sent = wholeRange(n) ? int64_t(n) * rounds : std::min<int64_t>(int64_t(sprayTargets) * rounds, n);
-        int total = int(std::min<int64_t>(sent, int64_t(plan.maxPackets)));
+        int total = int(std::min<int64_t>({int64_t(sprayTargets) * rounds, int64_t(n), int64_t(plan.maxPackets)}));
         return std::make_pair(birthday(maxSockets, total, n), std::make_pair(lo, n));
     };
 
@@ -439,25 +428,18 @@ PunchPlan planPunch(const PeerInfo& local, const PeerInfo& remote, const PunchLi
             else direct(cov);                   // we are X: open one mapping towards S
             plan.estimatedSuccess = cov;
         } else {
-            auto [p, range] = bdayP(X, xInfo.observed);
+            auto [p, range] = bdayP(X);
             plan.estimatedSuccess = p;
             if (hl == 0) {
                 plan.strategy = PunchStrategy::BirthdaySpray;
-                if (wholeRange(range.second)) {
-                    // The whole range, every round.
-                    plan.wholeRange = true;
-                    for (uint16_t port : comb(range.first, range.second, int(range.second), 0))
-                        plan.targets.push_back({rip, port});
-                } else {
-                    // One even comb over the range, dealt into R interleaved slices:
-                    // round r sprays slice r, itself an even comb of ~M ports.
-                    int total = int(std::min<int64_t>({int64_t(sprayTargets) * rounds, int64_t(range.second),
-                                                       int64_t(plan.maxPackets)}));
-                    auto ports = comb(range.first, range.second, total, 0.5);
-                    for (int r = 0; r < rounds; ++r)
-                        for (size_t i = size_t(r); i < ports.size(); i += size_t(rounds))
-                            plan.targets.push_back({rip, ports[i]});
-                }
+                // One even comb over the range, dealt into R interleaved slices:
+                // round r sprays slice r, itself an even comb of ~M ports.
+                int total = int(std::min<int64_t>({int64_t(sprayTargets) * rounds, int64_t(range.second),
+                                                   int64_t(plan.maxPackets)}));
+                auto ports = comb(range.first, range.second, total, 0.5);
+                for (int r = 0; r < rounds; ++r)
+                    for (size_t i = size_t(r); i < ports.size(); i += size_t(rounds))
+                        plan.targets.push_back({rip, ports[i]});
             } else {
                 plan.strategy = PunchStrategy::BirthdayListen;
                 plan.localSockets = maxSockets;
@@ -539,23 +521,27 @@ PunchPlan planUnknownPeer(const NatProfile& local, const Endpoint& remote, const
     p.maxPackets = std::max(0, lim.maxPackets);
     if (local.predictability == Predictability::Stable) {
         // The endpoint first, alone, as planDirect: a Stable peer answers
-        // there. From the second round on the whole block around it too: a
-        // Bounded peer's mapping towards us is a new port of that block.
+        // there. From the second round on the ports around it too: a Bounded
+        // peer's mapping towards us is a new port of the aligned block, a
+        // Predictable one's a port a little past the endpoint, which may lie
+        // past the block.
         p.strategy = PunchStrategy::BirthdaySpray;
         p.wholeRange = true;
         p.sprayFromRound = 1;
         p.targets = {remote};
         const uint32_t n = std::clamp<uint32_t>(lim.unknownBlock, 1, uint32_t(std::max(1, lim.maxTargets)));
         const uint32_t lo = (uint32_t(remote.port) / n) * n;
-        for (uint32_t port = lo; port < std::min<uint32_t>(lo + n, 65536); ++port)
+        const uint32_t hi = std::min<uint32_t>(std::max(lo + n, uint32_t(remote.port) + 1 + lim.unknownAhead), 65536);
+        for (uint32_t port = lo; port < hi; ++port)
             if (port != remote.port && port >= kFullLo) p.targets.push_back({remote.ip, uint16_t(port)});
         p.estimatedSuccess = 0.9;
-    } else if (hardness(local) == 2) {
-        // Bounded: our mapping towards the peer is a new port of our block,
-        // which a Stable peer sprays. Each socket opens one.
-        const int cap = lim.maxMappings > 0 ? lim.maxMappings : 1 << 30;
+    } else if (local.predictability == Predictability::Predictable ||
+               local.predictability == Predictability::Bounded) {
+        // Our mapping towards the peer is a new port, a little past the
+        // endpoint the channel saw or in its block, which a Stable peer
+        // sprays: one mapping is enough, the primary socket's.
         p.strategy = PunchStrategy::BirthdayListen;
-        p.localSockets = std::max(1, std::min(lim.maxSockets, cap));
+        p.localSockets = 1;
         p.targets = {remote};
         p.estimatedSuccess = 0.9;
     }

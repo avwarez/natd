@@ -89,15 +89,18 @@ struct PunchLimits {
     // subscriber blocks of ports (RFC 6888 port block allocation): 128 ports
     // measured on one; at most maxTargets.
     uint16_t unknownBlock = 128;
+    // planUnknownPeer: the ports past the endpoint seen that are sprayed too,
+    // beyond the end of the block: a sequential allocator's next mapping.
+    uint16_t unknownAhead = 64;
 };
 
 struct PunchPlan {
     PunchStrategy         strategy = PunchStrategy::Infeasible;
     int                   localSockets = 1;     // including the primary socket
     std::vector<Endpoint> targets;              // all on the remote observed IP
-    // BirthdaySpray: the remote range fits in one round, so every round
-    // sprays all of it (else each round sprays a new slice). A hard side that
-    // opens its mapping after our first round is still met by the next one.
+    // BirthdaySpray: every round sprays all the targets (planUnknownPeer),
+    // else each round sprays a new slice. A hard side that opens its mapping
+    // after our first round is still met by the next one.
     bool                  wholeRange = false;
     // wholeRange: the rounds before this one send to targets[0] alone.
     int                   sprayFromRound = 0;
@@ -131,17 +134,21 @@ PunchPlan planPunch(const PeerInfo& local, const PeerInfo& remote, const PunchLi
 PunchPlan planDirect(const NatProfile& local, const Endpoint& remote, const PunchLimits& = {});
 
 // Plan when the signalling channel carries only the remote endpoint and
-// nothing tells whether the peer's mapping is endpoint-independent or
-// dependent inside a block (Bounded, as on mobile CGNs). The peer's port then
-// is the one the channel saw (Stable) or a new port of the block around it
-// (Bounded).
+// nothing tells whether the peer's mapping is endpoint-independent,
+// sequential (Predictable) or random inside a block (Bounded, as on mobile
+// CGNs). The peer's port then is the one the channel saw (Stable), a port a
+// little past it (Predictable) or a new port of the block around it
+// (Bounded). The endpoint the channel saw should be a fresh mapping of the
+// peer's primary socket, as the one of a request it has just sent.
 //   We are Stable: BirthdaySpray. The first round goes to the endpoint alone
-//   (a Stable peer answers as with planDirect); every later round goes to it
-//   and to the whole aligned block of PunchLimits::unknownBlock ports around
-//   it (sprayFromRound 1, wholeRange).
-//   We are Bounded: BirthdayListen, the endpoint from maxSockets sockets
-//   (capped by maxMappings); the peer needs no block of ours.
-//   Otherwise Infeasible.
+//   (a Stable peer answers as with planDirect); every later round goes to it,
+//   to the whole aligned block of PunchLimits::unknownBlock ports around it
+//   and to the PunchLimits::unknownAhead ports past it (sprayFromRound 1,
+//   wholeRange).
+//   We are Predictable or Bounded: BirthdayListen, the endpoint from the
+//   primary socket alone; the peer needs no port of ours.
+//   Otherwise Infeasible: two sides that both open a new port each cannot
+//   find each other without sockets or ports beyond these.
 // With a port block per subscriber the spray reaches only the peer's own
 // mappings; behind a NAT without blocks it can reach other subscribers of the
 // same public IP, who drop it (the token is unknown to them).

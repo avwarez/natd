@@ -140,8 +140,9 @@ TxId tokenFrom(const uint8_t* key, size_t keyLen, uint64_t nonce);
 // What the application knows of a peer's NAT, for connect()/accept() with an
 // Endpoint. Stable: its mapping is endpoint-independent, the endpoint the
 // channel saw is the one to punch (planDirect). Unknown: the channel says
-// nothing (planUnknownPeer: a Stable side also sprays the block around the
-// endpoint after a first direct round; a Bounded side punches the endpoint).
+// nothing (planUnknownPeer: a Stable side also sprays the ports around the
+// endpoint after a first direct round; a Predictable or Bounded side punches
+// the endpoint from its primary socket).
 enum class PeerNat : uint8_t { Stable, Unknown };
 
 class Agent {
@@ -181,7 +182,8 @@ public:
     // A direct punch (planDirect) can work: endpoint-independent mapping.
     bool directPunchable() const;
     // A punch with a peer of unknown NAT (PeerNat::Unknown) can work: our
-    // mapping is endpoint-independent, or dependent inside a block (Bounded).
+    // mapping is endpoint-independent, sequential (Predictable) or random
+    // inside a block (Bounded).
     bool punchable() const;
     // What a peer needs for planPunch, when the channel can carry it
     // (localEndpoints left to the application, see PeerInfo).
@@ -212,7 +214,8 @@ public:
                      std::shared_ptr<IDatagramObfuscator> obfuscator = nullptr);
     // With what the application knows of the peer's NAT: PeerNat::Stable as
     // the calls above, PeerNat::Unknown with planUnknownPeer (refused unless
-    // punchable()). A Bounded side punches from limits.maxSockets sockets.
+    // punchable()). A Predictable or Bounded side punches from the primary
+    // socket alone.
     SessionId connect(const Endpoint& remote, PeerNat nat, const TxId& token, TimePoint now,
                       std::shared_ptr<IDatagramObfuscator> obfuscator = nullptr);
     SessionId accept(const Endpoint& remote, PeerNat nat, const TxId& token, TimePoint now,

@@ -164,7 +164,8 @@ struct Agent::Impl {
     }
     bool punchable() const {
         if (directPunchable()) return true;
-        return ready && profile.predictability == Predictability::Bounded && profile.publicEndpoint.valid();
+        return ready && profile.publicEndpoint.valid() &&
+               (profile.predictability == Predictability::Predictable || profile.predictability == Predictability::Bounded);
     }
 
     // False: no punch possible, or no room to wait for one.
@@ -362,9 +363,7 @@ void Agent::checkEndpoint(TimePoint now) {
 
 SessionId Agent::connect(const Endpoint& remote, const TxId& token, TimePoint now,
                          std::shared_ptr<IDatagramObfuscator> obf) {
-    if (!remote.valid()) return 0;
-    impl_->touch(now);
-    return impl_->open(false, remote, std::nullopt, token, std::move(obf), now);
+    return connect(remote, PeerNat::Stable, token, now, std::move(obf));
 }
 SessionId Agent::connect(const PeerInfo& remote, const TxId& token, TimePoint now,
                          std::shared_ptr<IDatagramObfuscator> obf) {
@@ -374,9 +373,7 @@ SessionId Agent::connect(const PeerInfo& remote, const TxId& token, TimePoint no
 }
 SessionId Agent::accept(const Endpoint& remote, const TxId& token, TimePoint now,
                         std::shared_ptr<IDatagramObfuscator> obf) {
-    if (!remote.valid()) return 0;
-    impl_->touch(now);
-    return impl_->open(true, remote, std::nullopt, token, std::move(obf), now);
+    return accept(remote, PeerNat::Stable, token, now, std::move(obf));
 }
 SessionId Agent::accept(const PeerInfo& remote, const TxId& token, TimePoint now,
                         std::shared_ptr<IDatagramObfuscator> obf) {
