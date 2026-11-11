@@ -12,6 +12,39 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-10
+
+A Bounded side (dependent mapping, random ports inside a block, as mobile
+CGNs do) can now be punched over a channel that carries only the endpoint it
+saw, such as an eD2K server's NAT callback.
+
+### API
+- `PeerNat` (`Stable`, `Unknown`) and `Agent::connect()`/`accept()` with an
+  `Endpoint` and a `PeerNat`: `Stable` is the Endpoint-only call,
+  `Unknown` plans with `planUnknownPeer`.
+- `planUnknownPeer()`: a Stable side punches the endpoint alone in the first
+  round and, from the second round on, also the whole aligned block of
+  `PunchLimits::unknownBlock` (128) ports around it; a Bounded side punches
+  the endpoint from `maxSockets` sockets.
+- `Agent::punchable()`: Stable or Bounded (a punch with `PeerNat::Unknown`
+  can work).
+- `PunchLimits::unknownBlock`, `PunchPlan::wholeRange`,
+  `PunchPlan::sprayFromRound`.
+
+### Behaviour
+- `planPunch`, birthday strategies: the hard side's block follows its
+  observed endpoint when that lies outside the block the discovery measured
+  (a CGN opens another block once the first is full; measured on a mobile
+  CGN with 128-port blocks).
+- A remote range that fits in one round (at most `maxTargets` ports) is
+  sprayed whole every round, instead of a new slice per round: a hard side
+  whose mapping opens after the first round is met by the next one.
+
+### Fixes
+- `Agent`: a request waiting for a punch session gave up after `punchWait`
+  only once a session was free; until then `poll()` kept answering a time
+  already past. It now gives up on time (found by the agent fuzz target).
+
 ## [0.2.1] - 2026-11-09
 
 ### API

@@ -378,6 +378,17 @@ applications, no more.
   lifetime `Unknown`). `planDirect` serves signalling channels that carry only
   the remote endpoint; `sessionTokenFrom` derives a session token from data
   both peers share.
+- **Peers of unknown NAT**: when the channel carries only the endpoint it
+  saw, `Agent::connect`/`accept` with `PeerNat::Unknown` (`planUnknownPeer`)
+  also reach a Bounded peer (a mobile CGN with random ports in a block): a
+  Stable side sends the first round to the endpoint alone, then sprays the
+  whole aligned block of `unknownBlock` ports around it every round; a
+  Bounded side punches the endpoint from `limits.maxSockets` sockets (one:
+  its primary socket only). The endpoint must be a recent mapping of the
+  Bounded side's punching socket, since a CGN that fills a block opens
+  another one. With a port block per subscriber the spray reaches only the
+  peer's own mappings; behind a NAT without blocks, other subscribers of the
+  same address may get punch packets, which they drop.
 
 ## Reflector requirements
 

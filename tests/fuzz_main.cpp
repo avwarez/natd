@@ -581,7 +581,13 @@ void fuzzAgent(const uint8_t* d, size_t n) {
                 if (s.u8() < 32) r = Endpoint{s.u32(), s.u16()};
                 const TxId tok = txIdFrom(s);
                 const bool inc = op % 12 == 1;
-                const SessionId id = inc ? agent.accept(r, tok, now) : agent.connect(r, tok, now);
+                SessionId id;
+                if (s.u8() & 1) {   // with what the application knows of the peer's NAT
+                    const PeerNat nat = (s.u8() & 1) ? PeerNat::Unknown : PeerNat::Stable;
+                    id = inc ? agent.accept(r, nat, tok, now) : agent.connect(r, nat, tok, now);
+                } else {
+                    id = inc ? agent.accept(r, tok, now) : agent.connect(r, tok, now);
+                }
                 if (id) {
                     if (held.count(id) || released.count(id)) fail("a session id given twice");
                     held[id] = Held{inc, r, tok};

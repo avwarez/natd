@@ -84,12 +84,23 @@ struct PunchLimits {
     // and M when our mapping is address+port dependent (one mapping per
     // target). The estimate follows the reduced plan. 0 = no cap.
     int      maxMappings = 128;
+    // planUnknownPeer: the block a peer of unknown NAT may take its ports
+    // from (an aligned block around the endpoint seen). Mobile CGNs give each
+    // subscriber blocks of ports (RFC 6888 port block allocation): 128 ports
+    // measured on one; at most maxTargets.
+    uint16_t unknownBlock = 128;
 };
 
 struct PunchPlan {
     PunchStrategy         strategy = PunchStrategy::Infeasible;
     int                   localSockets = 1;     // including the primary socket
     std::vector<Endpoint> targets;              // all on the remote observed IP
+    // BirthdaySpray: the remote range fits in one round, so every round
+    // sprays all of it (else each round sprays a new slice). A hard side that
+    // opens its mapping after our first round is still met by the next one.
+    bool                  wholeRange = false;
+    // wholeRange: the rounds before this one send to targets[0] alone.
+    int                   sprayFromRound = 0;
     Duration              sendInterval{4000};   // retransmit period (>= 3 s, RFC 8085 §3.1.3, see planPunch)
     Duration              packetSpacing{2};     // pacing inside a round
     Duration              budget{20000};
@@ -118,6 +129,23 @@ PunchPlan planPunch(const PeerInfo& local, const PeerInfo& remote, const PunchLi
 //   profile. Both follow RFC 8085 (at least 3 s and 15 s) unless the
 //   profile measured a shorter binding lifetime (a NAT below RFC 4787 REQ-5).
 PunchPlan planDirect(const NatProfile& local, const Endpoint& remote, const PunchLimits& = {});
+
+// Plan when the signalling channel carries only the remote endpoint and
+// nothing tells whether the peer's mapping is endpoint-independent or
+// dependent inside a block (Bounded, as on mobile CGNs). The peer's port then
+// is the one the channel saw (Stable) or a new port of the block around it
+// (Bounded).
+//   We are Stable: BirthdaySpray. The first round goes to the endpoint alone
+//   (a Stable peer answers as with planDirect); every later round goes to it
+//   and to the whole aligned block of PunchLimits::unknownBlock ports around
+//   it (sprayFromRound 1, wholeRange).
+//   We are Bounded: BirthdayListen, the endpoint from maxSockets sockets
+//   (capped by maxMappings); the peer needs no block of ours.
+//   Otherwise Infeasible.
+// With a port block per subscriber the spray reaches only the peer's own
+// mappings; behind a NAT without blocks it can reach other subscribers of the
+// same public IP, who drop it (the token is unknown to them).
+PunchPlan planUnknownPeer(const NatProfile& local, const Endpoint& remote, const PunchLimits& = {});
 
 // 96-bit session token from data both peers already hold (for instance
 // fields of the relayed request): SHA-256 of the data, truncated. It tells

@@ -66,7 +66,8 @@ struct Session {
     SessionId id = 0;
     bool incoming = false;
     Endpoint remote;
-    std::optional<PeerInfo> remoteInfo;     // planPunch; else planDirect
+    std::optional<PeerInfo> remoteInfo;     // planPunch; else planDirect or planUnknownPeer
+    bool unknownNat = false;                // planUnknownPeer
     TxId token{};
     std::shared_ptr<IDatagramObfuscator> obfuscator;
     TimePoint queuedAt{};
@@ -129,8 +130,8 @@ struct Agent::Impl {
     }
 
     SessionId open(bool incoming, const Endpoint& remote, std::optional<PeerInfo> info, const TxId& token,
-                   std::shared_ptr<IDatagramObfuscator> obf, TimePoint now) {
-        if (!directOk(info)) return 0;
+                   std::shared_ptr<IDatagramObfuscator> obf, TimePoint now, bool unknownNat = false) {
+        if (unknownNat ? !punchable() : !directOk(info)) return 0;
         if (incoming)
             for (auto& [id, s] : sessions)
                 if (s->token == token && !s->over) return 0;   // a request repeated while its punch is on
@@ -140,6 +141,7 @@ struct Agent::Impl {
         p->incoming = incoming;
         p->remote = remote;
         p->remoteInfo = std::move(info);
+        p->unknownNat = unknownNat;
         p->token = token;
         p->obfuscator = std::move(obf);
         if (p->obfuscator) ++obfuscated;
@@ -160,6 +162,10 @@ struct Agent::Impl {
     bool directPunchable() const {
         return ready && profile.predictability == Predictability::Stable && profile.publicEndpoint.valid();
     }
+    bool punchable() const {
+        if (directPunchable()) return true;
+        return ready && profile.predictability == Predictability::Bounded && profile.publicEndpoint.valid();
+    }
 
     // False: no punch possible, or no room to wait for one.
     bool startPunch(Session& s, TimePoint now) {
@@ -175,6 +181,9 @@ struct Agent::Impl {
             PeerInfo local = localPeerInfo();
             pc.plan = planPunch(local, *s.remoteInfo, cfg.limits);
             pc.remoteIp = s.remoteInfo->observed.ip;
+        } else if (s.unknownNat) {
+            pc.plan = planUnknownPeer(profile, s.remote, cfg.limits);
+            pc.remoteIp = s.remote.ip;
         } else {
             pc.plan = planDirect(profile, s.remote, cfg.limits);
             pc.remoteIp = s.remote.ip;
@@ -238,6 +247,16 @@ struct Agent::Impl {
                 lastCheck = now;
                 checkedOnce = true;
             }
+        }
+        // requests that waited too long, also while every punch session is busy
+        for (auto it = waiting.begin(); it != waiting.end();) {
+            Session* s = find(*it);
+            if (s && !s->over && now - s->queuedAt >= cfg.punchWait) {
+                fail(*s, PunchError::TimedOut);
+                ++stats.punchesRefused;
+            }
+            if (!s || s->over) it = waiting.erase(it);
+            else ++it;
         }
         // requests that waited for a free punch session
         while (!waiting.empty() && punching() < cfg.maxPunches) {
@@ -330,6 +349,7 @@ bool Agent::profileReady() const { return impl_->ready; }
 const NatProfile& Agent::profile() const { return impl_->profile; }
 Endpoint Agent::publicEndpoint() const { return impl_->ready ? impl_->profile.publicEndpoint : Endpoint{}; }
 bool Agent::directPunchable() const { return impl_->directPunchable(); }
+bool Agent::punchable() const { return impl_->punchable(); }
 PeerInfo Agent::localPeerInfo() const { return impl_->localPeerInfo(); }
 
 QuickCheckResult Agent::lastCheckResult() const { return impl_->lastCheckResult; }
@@ -363,6 +383,19 @@ SessionId Agent::accept(const PeerInfo& remote, const TxId& token, TimePoint now
     if (!remote.observed.valid()) return 0;
     impl_->touch(now);
     return impl_->open(true, remote.observed, remote, token, std::move(obf), now);
+}
+
+SessionId Agent::connect(const Endpoint& remote, PeerNat nat, const TxId& token, TimePoint now,
+                         std::shared_ptr<IDatagramObfuscator> obf) {
+    if (!remote.valid()) return 0;
+    impl_->touch(now);
+    return impl_->open(false, remote, std::nullopt, token, std::move(obf), now, nat == PeerNat::Unknown);
+}
+SessionId Agent::accept(const Endpoint& remote, PeerNat nat, const TxId& token, TimePoint now,
+                        std::shared_ptr<IDatagramObfuscator> obf) {
+    if (!remote.valid()) return 0;
+    impl_->touch(now);
+    return impl_->open(true, remote, std::nullopt, token, std::move(obf), now, nat == PeerNat::Unknown);
 }
 
 SessionPhase Agent::phase(SessionId id) const {
