@@ -2163,7 +2163,10 @@ static void testUnknownPeer() {
     const Hard hards[] = {
         {bounded(22144, 128), "Bounded, aligned block of 128", 100},
         {bounded(22100, 128), "Bounded, block of 128 not aligned", 100},
-        {bounded(22144, 64), "Bounded, block of 64", 100},
+        // 64 ports: discovery alone takes ~50 mappings, the block runs out
+        // before they expire and the NAT refuses new ones: Inconclusive, no
+        // punch attempted (minPct 0: no run expected).
+        {bounded(22144, 64), "Bounded, block of 64", 0},
         {bounded(22016, 256), "Bounded, block of 256", 100},
         {bounded(22016, 512), "Bounded, block of 512", 70},
         {sequential(1, 0), "Predictable, delta 1", 100},
@@ -2179,7 +2182,10 @@ static void testUnknownPeer() {
             for (int i = 0; i < 2; ++i) r.a[i]->start(r.w.loop.now);
             r.run(Duration(30000));
             const Predictability hp = r.a[1]->profile().predictability;
-            if (hp != Predictability::Predictable && hp != Predictability::Bounded) continue;
+            if (hp != Predictability::Predictable && hp != Predictability::Bounded) {
+                CHECK(!r.a[1]->punchable());   // never claims a punch it cannot make
+                continue;
+            }
             CHECK(r.a[0]->directPunchable() && r.a[0]->punchable());
             CHECK(!r.a[1]->directPunchable() && r.a[1]->punchable());
             const TxId tok = tokenFrom(key, 16, seed);
@@ -2212,7 +2218,7 @@ static void testUnknownPeer() {
         }
         std::printf("  %-36s <-> Stable APDF: %d/%d punched, %.0f packets, %.1f s on average\n",
                     h.name, ok, runs, ok ? packets / ok : 0.0, ok ? secs / ok : 0.0);
-        CHECK(runs >= 15);
+        CHECK(h.minPct == 0 ? runs == 0 : runs >= 15);
         CHECK(ok * 100 >= runs * h.minPct);
     }
     // A side that is neither Stable, Predictable nor Bounded cannot punch an

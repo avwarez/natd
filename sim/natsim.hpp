@@ -115,7 +115,8 @@ public:
     }
 
     // Outbound packet from local endpoint (lip, lp) to `to`: returns the
-    // external port, 0 if the mapping is refused (quota or rate limit).
+    // external port, 0 if the mapping is refused (quota, rate limit, or no
+    // free port left in the allocator's range until a mapping expires).
     uint16_t outbound(uint32_t lip, uint16_t lp, const Endpoint& to, TimePoint now) {
         gc(now);
         Key k = keyFor(lip, lp, to);
@@ -133,6 +134,7 @@ public:
             }
             Binding b;
             b.ext = allocate(lp, now);
+            if (!b.ext) { ++mappingsRefused; return 0; }   // no free port left (RFC 6888 REQ-4)
             it = bindings.emplace(k, b).first;
             extToKey[b.ext] = k;
             ++mappingsCreated;
@@ -180,7 +182,7 @@ public:
     NatModel nat;
     size_t mappingsCreated = 0;   // every mapping ever created (CGN port quota)
     size_t peakLive = 0;          // most mappings alive at once
-    size_t mappingsRefused = 0;   // refused by portQuota / mappingRate
+    size_t mappingsRefused = 0;   // refused by portQuota / mappingRate / no free port
 
 private:
     double tokens = 0;
@@ -223,39 +225,42 @@ private:
         }
         lastAllocAt = now;
         auto freePort = [&](uint32_t p) { return p >= 1024 && p <= 65535 && !extUsed.count(uint16_t(p)); };
+        // Ports come back only when their mappings expire (gc): with none free
+        // in the range the allocator draws from, the mapping is refused (0).
+        // Random allocators draw a bounded number of times, then scan.
+        auto pick = [&](uint32_t lo, uint32_t n) -> uint32_t {
+            for (int i = 0; i < 64; ++i)
+                if (uint32_t q = lo + rng() % n; freePort(q)) return q;
+            const uint32_t from = rng() % n;
+            for (uint32_t i = 0; i < n; ++i)
+                if (uint32_t q = lo + (from + i) % n; freePort(q)) return q;
+            return 0;
+        };
         uint32_t p = 0;
         switch (nat.alloc) {
         case Alloc::Preserve:
-            p = lp;
-            while (!freePort(p)) p = 1024 + rng() % 64512;
+            p = freePort(lp) ? lp : pick(1024, 64512);
             break;
         case Alloc::Sequential:
-        case Alloc::Noisy:
+        case Alloc::Noisy: {
             p = nextAlloc;
             if (nat.alloc == Alloc::Noisy) p += rng() % (nat.noiseMax + 1);
             if (p > 65535) p = 1024;
-            while (!freePort(p)) { p += nat.delta; if (p > 65535) p = 1024; }
+            int tries = 0;
+            while (!freePort(p) && ++tries <= 64512) { p += nat.delta; if (p > 65535 || p < 1024) p = 1024; }
+            if (!freePort(p)) return 0;
             nextAlloc = p + nat.delta;
             if (nextAlloc > 65535) nextAlloc = 1024;
             break;
-        case Alloc::RandomBlock:
-        {
-            // A full block: the CGN gives the subscriber another one (RFC 7422).
-            auto full = [&] {
-                for (uint32_t q = nat.blockBase; q < uint32_t(nat.blockBase) + nat.blockSize; ++q)
-                    if (freePort(q)) return false;
-                return true;
-            };
-            while (full())
-                nat.blockBase = uint16_t(uint32_t(nat.blockBase) + nat.blockSize + nat.blockSize > 65536
-                                             ? 1024 : nat.blockBase + nat.blockSize);
-            do { p = nat.blockBase + rng() % nat.blockSize; } while (!freePort(p));
         }
+        case Alloc::RandomBlock:
+            p = pick(nat.blockBase, nat.blockSize);
             break;
         case Alloc::RandomFull:
-            do { p = 1024 + rng() % 64512; } while (!freePort(p));
+            p = pick(1024, 64512);
             break;
         }
+        if (!p) return 0;
         if (lp) extUsed.insert(uint16_t(p));   // consume(): other subscribers, port reused later
         return uint16_t(p);
     }

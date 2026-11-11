@@ -12,6 +12,21 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-11
+
+Tests and simulator only; the library is unchanged.
+
+### Fixes
+- Simulator: a NAT with no free port left in the range its allocator draws
+  from refuses the new mapping and drops the packet (RFC 6888 REQ-4), and
+  ports come back only when their mappings expire (the model's binding
+  lifetimes). This replaces 0.5.0's move to a new block, and the random
+  allocators draw a bounded number of times before a scan, so no allocator
+  loops.
+- Tests: on a block of 64 ports the discovery's own mappings (~50) use the
+  block up before they expire; the side is then Inconclusive and not
+  punchable, which the test now checks instead of a punch.
+
 ## [0.5.0] - 2026-11-11
 
 The spray towards a peer of unknown NAT no longer assumes a block size or
