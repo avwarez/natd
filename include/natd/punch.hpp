@@ -84,14 +84,12 @@ struct PunchLimits {
     // and M when our mapping is address+port dependent (one mapping per
     // target). The estimate follows the reduced plan. 0 = no cap.
     int      maxMappings = 128;
-    // planUnknownPeer: the block a peer of unknown NAT may take its ports
-    // from (an aligned block around the endpoint seen). Mobile CGNs give each
-    // subscriber blocks of ports (RFC 6888 port block allocation): 128 ports
-    // measured on one; at most maxTargets.
-    uint16_t unknownBlock = 128;
-    // planUnknownPeer: the ports past the endpoint seen that are sprayed too,
-    // beyond the end of the block: a sequential allocator's next mapping.
-    uint16_t unknownAhead = 64;
+    // planUnknownPeer: the ports around the endpoint seen that the first
+    // spray round sends to; each later round sends to twice as many, the
+    // nearest first, until maxPackets. Nothing is assumed of the size or the
+    // alignment of a block of ports: they differ from one operator to the
+    // next.
+    int      unknownSpray = 192;
 };
 
 struct PunchPlan {
@@ -104,6 +102,9 @@ struct PunchPlan {
     bool                  wholeRange = false;
     // wholeRange: the rounds before this one send to targets[0] alone.
     int                   sprayFromRound = 0;
+    // wholeRange: round sprayFromRound sends to the first 1 + roundTargets
+    // targets, each later round to twice as many (0: all of them).
+    int                   roundTargets = 0;
     Duration              sendInterval{4000};   // retransmit period (>= 3 s, RFC 8085 §3.1.3, see planPunch)
     Duration              packetSpacing{2};     // pacing inside a round
     Duration              budget{20000};
@@ -141,10 +142,11 @@ PunchPlan planDirect(const NatProfile& local, const Endpoint& remote, const Punc
 // (Bounded). The endpoint the channel saw should be a fresh mapping of the
 // peer's primary socket, as the one of a request it has just sent.
 //   We are Stable: BirthdaySpray. The first round goes to the endpoint alone
-//   (a Stable peer answers as with planDirect); every later round goes to it,
-//   to the whole aligned block of PunchLimits::unknownBlock ports around it
-//   and to the PunchLimits::unknownAhead ports past it (sprayFromRound 1,
-//   wholeRange).
+//   (a Stable peer answers as with planDirect); the second to it and to the
+//   PunchLimits::unknownSpray ports nearest to it, each later round to twice
+//   as many (sprayFromRound 1, roundTargets), within maxPackets. Nearest:
+//   a port i past the endpoint ranks as one 2i before it, since a sequential
+//   allocator counts up and a block holds the endpoint anywhere.
 //   We are Predictable or Bounded: BirthdayListen, the endpoint from the
 //   primary socket alone; the peer needs no port of ours.
 //   Otherwise Infeasible: two sides that both open a new port each cannot

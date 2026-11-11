@@ -382,9 +382,12 @@ applications, no more.
   saw, `Agent::connect`/`accept` with `PeerNat::Unknown` (`planUnknownPeer`)
   also reach a Predictable peer (sequential ports) and a Bounded one (a
   mobile CGN with random ports in a block). A Stable side sends the first
-  round to the endpoint alone, then sprays every round the whole aligned
-  block of `unknownBlock` ports around it and the `unknownAhead` ports past
-  it; a Predictable or Bounded side punches the endpoint from its primary
+  round to the endpoint alone, the second to it and the `unknownSpray` ports
+  nearest to it, each later round to twice as many, within `maxPackets`
+  (nearest: a port i past the endpoint ranks as one 2i before it, since a
+  sequential allocator counts up and a block holds the endpoint anywhere).
+  Nothing is assumed of the size or the alignment of a block: they differ
+  from one operator to the next. A Predictable or Bounded side punches the endpoint from its primary
   socket only. The endpoint must be a fresh mapping of that socket, as the
   one of a request it has just sent to the channel: the peer's next mapping
   then follows it, or lies in its block. Two sides that both open a new port

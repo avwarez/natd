@@ -12,6 +12,31 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-11
+
+The spray towards a peer of unknown NAT no longer assumes a block size or
+alignment (those of one operator): it grows from the endpoint seen outwards.
+
+### API
+- `PunchLimits::unknownBlock` and `unknownAhead` are replaced by
+  `unknownSpray` (192): the ports the second round sprays besides the
+  endpoint.
+- `PunchPlan::roundTargets`: with `wholeRange`, round `sprayFromRound` sends
+  to the first 1 + `roundTargets` targets, each later round to twice as many.
+
+### Behaviour
+- `planUnknownPeer`, Stable side: the targets are the endpoint and then the
+  ports nearest to it, a port i past it ranking as one 2i before it, up to
+  `maxPackets`; the rounds after the first send to a window that doubles
+  each round (193, 385, 769, then the rest of the 2000 packets). Measured
+  in the simulator against a Stable APDF side, 20 seeds each: blocks of
+  64/128 (aligned or not)/256 all punched, 512 18/20; sequential delta 1, 2,
+  -1 and with other subscribers all punched in the second round.
+
+### Fixes
+- Simulator: a Bounded NAT whose block is full gives the subscriber another
+  block (RFC 7422) instead of looping for a free port.
+
 ## [0.4.0] - 2026-11-11
 
 A Predictable side (sequential ports) can now be punched over a channel that

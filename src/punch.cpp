@@ -521,19 +521,24 @@ PunchPlan planUnknownPeer(const NatProfile& local, const Endpoint& remote, const
     p.maxPackets = std::max(0, lim.maxPackets);
     if (local.predictability == Predictability::Stable) {
         // The endpoint first, alone, as planDirect: a Stable peer answers
-        // there. From the second round on the ports around it too: a Bounded
-        // peer's mapping towards us is a new port of the aligned block, a
-        // Predictable one's a port a little past the endpoint, which may lie
-        // past the block.
+        // there. From the second round on the ports around it too, more each
+        // round, the nearest first: a Predictable peer's mapping towards us
+        // is a port a little past the endpoint, a Bounded one's a port of the
+        // block that holds it, wherever the block starts.
         p.strategy = PunchStrategy::BirthdaySpray;
         p.wholeRange = true;
         p.sprayFromRound = 1;
+        p.roundTargets = std::max(1, lim.unknownSpray);
         p.targets = {remote};
-        const uint32_t n = std::clamp<uint32_t>(lim.unknownBlock, 1, uint32_t(std::max(1, lim.maxTargets)));
-        const uint32_t lo = (uint32_t(remote.port) / n) * n;
-        const uint32_t hi = std::min<uint32_t>(std::max(lo + n, uint32_t(remote.port) + 1 + lim.unknownAhead), 65536);
-        for (uint32_t port = lo; port < hi; ++port)
-            if (port != remote.port && port >= kFullLo) p.targets.push_back({remote.ip, uint16_t(port)});
+        // a port `a` past the endpoint ranks as one 2a before it
+        uint32_t a = 1, b = 1;
+        while (p.targets.size() < size_t(p.maxPackets)) {
+            const bool ahead = uint32_t(remote.port) + a <= 65535;
+            const bool behind = uint32_t(remote.port) >= kFullLo + b;
+            if (!ahead && !behind) break;
+            if (ahead && (!behind || a <= 2 * b)) p.targets.push_back({remote.ip, uint16_t(remote.port + a++)});
+            else p.targets.push_back({remote.ip, uint16_t(remote.port - b++)});
+        }
         p.estimatedSuccess = 0.9;
     } else if (local.predictability == Predictability::Predictable ||
                local.predictability == Predictability::Bounded) {
@@ -620,6 +625,11 @@ struct PunchSession::Impl {
             size_t per = (targets.size() + R - 1) / R;
             size_t from = (size_t(round) % R) * per;
             for (size_t i = from; i < std::min(targets.size(), from + per); ++i) cur.push_back(targets[i]);
+        } else if (cfg.plan.strategy == PunchStrategy::BirthdaySpray && cfg.plan.roundTargets > 0) {
+            // the nearest targets, twice as many each round
+            const int grow = std::min(round - cfg.plan.sprayFromRound, 20);
+            const uint64_t n = 1 + (uint64_t(cfg.plan.roundTargets) << std::max(0, grow));
+            cur.assign(targets.begin(), targets.begin() + ptrdiff_t(std::min<uint64_t>(n, targets.size())));
         } else {
             cur = targets;
         }

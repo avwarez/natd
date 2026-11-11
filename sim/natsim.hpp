@@ -239,7 +239,18 @@ private:
             if (nextAlloc > 65535) nextAlloc = 1024;
             break;
         case Alloc::RandomBlock:
+        {
+            // A full block: the CGN gives the subscriber another one (RFC 7422).
+            auto full = [&] {
+                for (uint32_t q = nat.blockBase; q < uint32_t(nat.blockBase) + nat.blockSize; ++q)
+                    if (freePort(q)) return false;
+                return true;
+            };
+            while (full())
+                nat.blockBase = uint16_t(uint32_t(nat.blockBase) + nat.blockSize + nat.blockSize > 65536
+                                             ? 1024 : nat.blockBase + nat.blockSize);
             do { p = nat.blockBase + rng() % nat.blockSize; } while (!freePort(p));
+        }
             break;
         case Alloc::RandomFull:
             do { p = 1024 + rng() % 64512; } while (!freePort(p));
