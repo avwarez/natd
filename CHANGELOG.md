@@ -12,6 +12,14 @@ change), wire format changes, behaviour changes, and fixes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
+### API
+- `AgentEvent::packets` and `AgentEvent::rounds`: on `Punched` and
+  `PunchFailed`, the PUNCH packets the session sent (ACKs excluded) and the
+  rounds it started, for the application's diagnostics.
+- `PunchSession::packetsSent()` and `rounds()`.
+
 ## [0.5.1] - 2026-11-11
 
 Tests and simulator only; the library is unchanged.

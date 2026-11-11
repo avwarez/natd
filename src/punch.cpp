@@ -727,5 +727,7 @@ PunchState PunchSession::state() const { return impl_->st; }
 SocketId PunchSession::establishedSocket() const { return impl_->estSock; }
 Endpoint PunchSession::remoteEndpoint() const { return impl_->estEp; }
 Duration PunchSession::keepalive() const { return impl_->cfg.plan.keepalive; }
+int PunchSession::packetsSent() const { return impl_->punchesSent; }
+int PunchSession::rounds() const { return impl_->round; }
 
 } // namespace natd

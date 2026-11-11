@@ -2207,6 +2207,12 @@ static void testUnknownPeer() {
             ++runs;
             const auto r0 = r.a[0]->takeResult(s0, r.w.loop.now);
             const auto r1 = r.a[1]->takeResult(s1, r.w.loop.now);
+            for (const AgentEvent& e : r.ev[0])
+                if (e.session == s0 && (e.type == AgentEventType::Punched || e.type == AgentEventType::PunchFailed)) {
+                    // diagnostics: what the session sent, as counted on the wire
+                    CHECK(e.packets > 0 && e.rounds > 0);
+                    CHECK(e.packets <= r.out[0] - before);
+                }
             if (r0 && r1) {
                 ++ok;
                 packets += double(r.out[0] - before);

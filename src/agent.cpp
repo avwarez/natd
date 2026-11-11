@@ -113,8 +113,13 @@ struct Agent::Impl {
         auto it = sessions.find(id);
         return it == sessions.end() ? nullptr : it->second.get();
     }
-    void emit(AgentEventType t, SessionId id = 0, PunchError e = PunchError::None) {
-        events.push_back(AgentEvent{t, id, e});
+    void emit(AgentEventType t, SessionId id = 0, PunchError e = PunchError::None, const PunchSession* p = nullptr) {
+        AgentEvent ev{t, id, e};
+        if (p) {
+            ev.packets = uint32_t(std::max(0, p->packetsSent()));
+            ev.rounds = uint16_t(std::min(65535, std::max(0, p->rounds())));
+        }
+        events.push_back(ev);
     }
     size_t punching() const {
         size_t n = 0;
@@ -125,8 +130,8 @@ struct Agent::Impl {
         if (s.over) return;
         if (e == PunchError::Refused) ++stats.punchesRefused;
         s.over = true;
+        emit(AgentEventType::PunchFailed, s.id, e, s.punch.get());
         s.punch.reset();
-        emit(AgentEventType::PunchFailed, s.id, e);
     }
 
     SessionId open(bool incoming, const Endpoint& remote, std::optional<PeerInfo> info, const TxId& token,
@@ -282,7 +287,7 @@ struct Agent::Impl {
                     s.punched = true;
                     s.remote = s.punch->remoteEndpoint();
                     ++stats.punchesEstablished;
-                    emit(AgentEventType::Punched, s.id);
+                    emit(AgentEventType::Punched, s.id, PunchError::None, s.punch.get());
                 } else if (st == PunchState::Failed) {
                     fail(s, PunchError::TimedOut);
                     ++stats.punchesFailed;

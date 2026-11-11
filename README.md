@@ -183,7 +183,10 @@ the punch, to answer the peer's PUNCH packets until the punch budget ends
 endpoint is the application's. The application sends something on the path
 at least every `keepalive` while it is idle, decides itself when the path is
 dead (and then asks `checkEndpoint()`), and closes it its own way;
-`cancel()` gives up on a session that has not been handed over.
+`cancel()` gives up on a session that has not been handed over. Both
+events carry, for diagnostics, the PUNCH packets the session sent and the
+rounds it started (`AgentEvent::packets`, `rounds`): a failed punch that
+stopped early tells apart from one that sprayed its whole budget.
 
 ```cpp
 natd::AgentConfig cfg;

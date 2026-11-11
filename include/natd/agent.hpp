@@ -86,6 +86,11 @@ struct AgentEvent {
     AgentEventType type;
     SessionId      session = 0;
     PunchError     error = PunchError::None;
+    // Punched and PunchFailed, for the application's diagnostics: the PUNCH
+    // packets the session sent (ACKs excluded) and the rounds it started
+    // (0 and 0 when it never started punching).
+    uint32_t       packets = 0;
+    uint16_t       rounds = 0;
 };
 
 // Counters, for the application's diagnostics.

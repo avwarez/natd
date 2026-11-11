@@ -194,6 +194,9 @@ public:
     SocketId   establishedSocket() const;   // valid when Established
     Endpoint   remoteEndpoint() const;      // valid when Established
     Duration   keepalive() const;
+    // Diagnostics: PUNCH packets sent (ACKs excluded) and rounds started.
+    int        packetsSent() const;
+    int        rounds() const;
 
 private:
     struct Impl;
